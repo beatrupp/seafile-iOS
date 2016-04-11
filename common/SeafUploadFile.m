@@ -136,7 +136,7 @@ static NSMutableDictionary *uploadFileAttrs = nil;
         [self updateProgress:nil];
     }
     if (result && !_autoSync)
-        [[NSFileManager defaultManager] linkItemAtPath:self.lpath toPath:[SeafGlobal.sharedObject documentPath:oid] error:nil];
+        [Utils linkFileAtPath:self.lpath to:[SeafGlobal.sharedObject documentPath:oid]];
 
     self.rawblksurl = nil;
     self.commiturl = nil;
@@ -580,6 +580,7 @@ static NSMutableDictionary *uploadFileAttrs = nil;
 
 - (NSDictionary *)uploadAttr
 {
+    if (!self.lpath) return [NSDictionary new];
     return [[SeafUploadFile uploadFileAttrs] objectForKey:self.lpath];
 }
 

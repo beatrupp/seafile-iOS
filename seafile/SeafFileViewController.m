@@ -133,6 +133,7 @@ enum {
     [self.detailViewController setPreViewItem:nil master:nil];
     [conn loadRepos:self];
     [self setDirectory:(SeafDir *)conn.rootFolder];
+    [self refreshView];
 }
 
 - (void)showLodingView
@@ -194,6 +195,7 @@ enum {
 
     self.navigationController.navigationBar.tintColor = BAR_COLOR;
     [self.navigationController setToolbarHidden:YES animated:NO];
+    [self refreshView];
 }
 
 - (void)noneSelected:(BOOL)none
@@ -430,7 +432,6 @@ enum {
         self.tableView.sectionHeaderHeight = 0;
     [_connection checkSyncDst:_directory];
 
-    [self refreshView];
     [_directory setDelegate:self];
 }
 
@@ -662,23 +663,25 @@ enum {
 - (void)updateCellDownloadStatus:(SeafCell *)cell isDownloading:(BOOL )isDownloading waiting:(BOOL)waiting cached:(BOOL)cached
 {
     //Debug("... %d %d %d", cached, waiting, isDownloading);
-    if (cached || waiting || isDownloading) {
-        cell.cacheStatusView.hidden = false;
-        [cell.cacheStatusWidthConstraint setConstant:21.0f];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (cached || waiting || isDownloading) {
+            cell.cacheStatusView.hidden = false;
+            [cell.cacheStatusWidthConstraint setConstant:21.0f];
 
-        if (isDownloading) {
-            [cell.downloadingIndicator startAnimating];
+            if (isDownloading) {
+                [cell.downloadingIndicator startAnimating];
+            } else {
+                NSString *downloadImageNmae = waiting ? @"download_waiting" : @"download_finished";
+                cell.downloadStatusImageView.image = [UIImage imageNamed:downloadImageNmae];
+            }
+            cell.downloadStatusImageView.hidden = isDownloading;
+            cell.downloadingIndicator.hidden = !isDownloading;
         } else {
-            NSString *downloadImageNmae = waiting ? @"download_waiting" : @"download_finished";
-            cell.downloadStatusImageView.image = [UIImage imageNamed:downloadImageNmae];
+            cell.cacheStatusView.hidden = true;
+            [cell.cacheStatusWidthConstraint setConstant:0.0f];
         }
-        cell.downloadStatusImageView.hidden = isDownloading;
-        cell.downloadingIndicator.hidden = !isDownloading;
-    } else {
-        cell.cacheStatusView.hidden = true;
-        [cell.cacheStatusWidthConstraint setConstant:0.0f];
-    }
-    [cell layoutIfNeeded];
+        [cell layoutIfNeeded];
+    });
 }
 
 - (void)updateCellContent:(SeafCell *)cell file:(SeafFile *)sfile
@@ -911,7 +914,7 @@ enum {
     }
     _curEntry = [self getDentrybyIndexPath:indexPath tableView:tableView];
     if (!_curEntry) {
-        return [self performSelector:@selector(reloadData) withObject:nil afterDelay:0.1];
+        return [self.tableView performSelector:@selector(reloadData) withObject:nil afterDelay:0.1];
     }
     if ([_curEntry isKindOfClass:[SeafRepo class]] && [(SeafRepo *)_curEntry passwordRequired]) {
         return [self popupSetRepoPassword:(SeafRepo *)_curEntry];
@@ -1610,7 +1613,7 @@ enum {
 
 - (void)setSearchState:(UISearchDisplayController *)controller state:(NSString *)state
 {
-    dispatch_time_t popTime = dispatch_time(DISPATCH_TIME_NOW, 0.001);
+    dispatch_time_t popTime = dispatch_time(DISPATCH_TIME_NOW, 0.001*NSEC_PER_SEC);
     dispatch_after(popTime, dispatch_get_main_queue(), ^(void){
         for (UIView* v in controller.searchResultsTableView.subviews) {
             if ([v isKindOfClass: [UILabel class]] &&

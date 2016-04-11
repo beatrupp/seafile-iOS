@@ -193,6 +193,7 @@ static AFHTTPRequestSerializer <AFURLRequestSerialization> * _requestSerializer;
 
 - (NSString *)getAttribute:(NSString *)aKey
 {
+    if (!aKey) return nil;
     return [_settings objectForKey:aKey];
 }
 
@@ -243,6 +244,17 @@ static AFHTTPRequestSerializer <AFURLRequestSerialization> * _requestSerializer;
 {
     if (self.localDecryption == localDecryption) return;
     [self setAttribute:[NSNumber numberWithBool:localDecryption] forKey:@"localDecryption"];
+}
+
+- (BOOL)touchIdEnabled
+{
+    return [[self getAttribute:@"touchIdEnabled"] booleanValue:false];
+}
+
+- (void)setTouchIdEnabled:(BOOL)touchIdEnabled
+{
+    if (self.touchIdEnabled == touchIdEnabled) return;
+    [self setAttribute:[NSNumber numberWithBool:touchIdEnabled] forKey:@"touchIdEnabled"];
 }
 
 - (void)setAutoClearRepoPasswd:(BOOL)autoClearRepoPasswd
