@@ -5,7 +5,8 @@
 //  Created by Wei Wang on 7/7/12.
 //  Copyright (c) 2012 Seafile Ltd. All rights reserved.
 //
-#import <MWPhotoBrowser.h>
+#import "MWPhotoBrowser.h"
+#import "UIScrollView+SVPullToRefresh.h"
 
 #import "SeafAppDelegate.h"
 #import "SeafFileViewController.h"
@@ -14,9 +15,8 @@
 #import "SeafFile.h"
 #import "SeafRepos.h"
 #import "SeafCell.h"
-#import "SeafUploadingFileCell.h"
 #import "SeafPhoto.h"
-#import "SeafThumb.h"
+#import "SeafPhotoThumb.h"
 
 #import "FileSizeFormatter.h"
 #import "SeafDateFormatter.h"
@@ -42,7 +42,7 @@ enum {
 };
 
 
-@interface SeafFileViewController ()<QBImagePickerControllerDelegate, UIPopoverControllerDelegate, SeafUploadDelegate, EGORefreshTableHeaderDelegate, SeafDirDelegate, SeafShareDelegate, SeafRepoPasswordDelegate, UISearchBarDelegate, UISearchDisplayDelegate, UIActionSheetDelegate, MFMailComposeViewControllerDelegate, SWTableViewCellDelegate, MWPhotoBrowserDelegate>
+@interface SeafFileViewController ()<QBImagePickerControllerDelegate, UIPopoverControllerDelegate, SeafUploadDelegate, SeafDirDelegate, SeafShareDelegate, UISearchBarDelegate, UISearchDisplayDelegate, MFMailComposeViewControllerDelegate, SWTableViewCellDelegate, MWPhotoBrowserDelegate>
 - (UITableViewCell *)getSeafFileCell:(SeafFile *)sfile forTableView:(UITableView *)tableView;
 - (UITableViewCell *)getSeafDirCell:(SeafDir *)sdir forTableView:(UITableView *)tableView;
 - (UITableViewCell *)getSeafRepoCell:(SeafRepo *)srepo forTableView:(UITableView *)tableView;
@@ -58,13 +58,9 @@ enum {
 @property (strong) UIBarButtonItem *editItem;
 @property (strong) NSArray *rightItems;
 
-@property (readonly) EGORefreshTableHeaderView* refreshHeaderView;
-
 @property (retain) SWTableViewCell *selectedCell;
 @property (retain) NSIndexPath *selectedindex;
 @property (readonly) NSArray *editToolItems;
-
-@property (strong) UIActionSheet *actionSheet;
 
 @property int state;
 
@@ -118,7 +114,7 @@ enum {
 
         fixedSpaceItem.width = 38.0f;;
         for (i = 1; i < itemsTitles.count + 1; ++i) {
-            items[i] = [[UIBarButtonItem alloc] initWithTitle:[itemsTitles objectAtIndex:i-1] style:UIBarButtonItemStyleBordered target:self action:@selector(editOperation:)];
+            items[i] = [[UIBarButtonItem alloc] initWithTitle:[itemsTitles objectAtIndex:i-1] style:UIBarButtonItemStylePlain target:self action:@selector(editOperation:)];
             items[i].tag = i;
         }
 
@@ -129,14 +125,12 @@ enum {
 
 - (void)setConnection:(SeafConnection *)conn
 {
-    self.searchDisplayController.active = NO;
     [self.detailViewController setPreViewItem:nil master:nil];
     [conn loadRepos:self];
     [self setDirectory:(SeafDir *)conn.rootFolder];
-    [self refreshView];
 }
 
-- (void)showLodingView
+- (void)showLoadingView
 {
     if (!self.loadingView) {
         self.loadingView = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleWhiteLarge];
@@ -172,17 +166,13 @@ enum {
         [self.tableView setSeparatorInset:UIEdgeInsetsMake(0, 0, 0, 0)];
     self.formatter = [[NSDateFormatter alloc] init];
     [self.formatter setDateFormat:@"yyyy-MM-dd HH.mm.ss"];
-    self.tableView.rowHeight = 50;
-
+    self.tableView.rowHeight = UITableViewAutomaticDimension;
+    self.tableView.estimatedRowHeight = 50.0;
     self.state = STATE_INIT;
-    _refreshHeaderView = [[EGORefreshTableHeaderView alloc] initWithFrame:CGRectMake(0.0f, 0.0f - self.tableView.bounds.size.height, self.view.frame.size.width, self.tableView.bounds.size.height)];
-    _refreshHeaderView.delegate = self;
-    [_refreshHeaderView refreshLastUpdatedDate];
-    [self.tableView addSubview:_refreshHeaderView];
 
     self.searchBar = [[UISearchBar alloc] initWithFrame:CGRectZero];
     self.searchBar.searchTextPositionAdjustment = UIOffsetMake(0, 0);
-    self.searchBar.placeholder = NSLocalizedString(@"Search", @"Seafile");
+    Debug("repoId:%@, %@, path:%@, loading ... cached:%d %@\n", _directory.repoId, _directory.name, _directory.path, _directory.hasCache, _directory.ooid);
     self.searchBar.delegate = self;
     [self.searchBar sizeToFit];
     self.strongSearchDisplayController = [[UISearchDisplayController alloc] initWithSearchBar:self.searchBar contentsController:self];
@@ -195,6 +185,20 @@ enum {
 
     self.navigationController.navigationBar.tintColor = BAR_COLOR;
     [self.navigationController setToolbarHidden:YES animated:NO];
+
+    __weak typeof(self) weakSelf = self;
+    [self.tableView addPullToRefreshWithActionHandler:^{
+        if (weakSelf.searchDisplayController.active)
+            return;
+        if (![weakSelf checkNetworkStatus]) {
+            [weakSelf performSelector:@selector(doneLoadingTableViewData) withObject:nil afterDelay:0.1];
+            return;
+        }
+
+        weakSelf.state = STATE_LOADING;
+        weakSelf.directory.delegate = weakSelf;
+        [weakSelf.directory loadContent:YES];
+    }];
     [self refreshView];
 }
 
@@ -245,7 +249,7 @@ enum {
             id<SeafPreView> file = entry;
             [file setDelegate:self];
             [seafPhotos addObject:[[SeafPhoto alloc] initWithSeafPreviewIem:entry]];
-            [seafThumbs addObject:[[SeafThumb alloc] initWithSeafPreviewIem:entry]];
+            [seafThumbs addObject:[[SeafPhotoThumb alloc] initWithSeafPreviewIem:entry]];
         }
     }
     self.photos = [NSArray arrayWithArray:seafPhotos];
@@ -254,6 +258,14 @@ enum {
 
 - (void)refreshView
 {
+    if (!_directory)
+        return;
+    if ([_directory isKindOfClass:[SeafRepos class]]) {
+        self.searchBar.placeholder = NSLocalizedString(@"Search", @"Seafile");
+    } else {
+        self.searchBar.placeholder = NSLocalizedString(@"Search files in this library", @"Seafile");
+    }
+
     [self initSeafPhotos];
     for (SeafUploadFile *file in _directory.uploadFiles) {
         file.delegate = self;
@@ -268,9 +280,9 @@ enum {
         else
             [self noneSelected:NO];
     }
-    if (!_directory.hasCache) {
-        Debug("no cache, load from server.");
-        [self showLodingView];
+    if (_directory && !_directory.hasCache) {
+        Debug("no cache, load %@ from server.", _directory.path);
+        [self showLoadingView];
         self.state = STATE_LOADING;
     }
 }
@@ -279,7 +291,6 @@ enum {
 {
     [super viewDidUnload];
     [self setLoadingView:nil];
-    _refreshHeaderView = nil;
     _directory = nil;
     _curEntry = nil;
 }
@@ -289,6 +300,11 @@ enum {
     [super didReceiveMemoryWarning];
     if (!self.isVisible)
         [_directory unload];
+}
+- (void)viewWillTransitionToSize:(CGSize)size
+       withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator
+{
+    [super viewWillTransitionToSize:size withTransitionCoordinator:coordinator];
 }
 
 - (void)selectAll:(id)sender
@@ -316,9 +332,8 @@ enum {
 
 - (void)setEditing:(BOOL)editing animated:(BOOL)animated
 {
-    SeafAppDelegate *appdelegate = (SeafAppDelegate *)[[UIApplication sharedApplication] delegate];
     if (editing) {
-        if (![appdelegate checkNetworkStatus]) return;
+        if (![self checkNetworkStatus]) return;
         [self.navigationController.toolbar sizeToFit];
         [self setToolbarItems:self.editToolItems];
         [self noneSelected:YES];
@@ -339,11 +354,11 @@ enum {
 {
     if(self.popoverController)
         return;
-    if (![QBImagePickerController isAccessible]) {
-        Warning("Error: Source is not accessible.");
-        [self alertWithTitle:NSLocalizedString(@"Photos are not accessible", @"Seafile")];
-        return;
+    if([ALAssetsLibrary authorizationStatus] == ALAuthorizationStatusRestricted ||
+       [ALAssetsLibrary authorizationStatus] == ALAuthorizationStatusDenied) {
+        return [self alertWithTitle:NSLocalizedString(@"This app does not have access to your photos and videos.", @"Seafile") message:NSLocalizedString(@"You can enable access in Privacy Settings", @"Seafile")];
     }
+
     QBImagePickerController *imagePickerController = [[QBImagePickerController alloc] init];
     imagePickerController.title = NSLocalizedString(@"Photos", @"Seafile");
     imagePickerController.delegate = self;
@@ -387,10 +402,10 @@ enum {
     if ([_directory isKindOfClass:[SeafRepos class]]) {
         titles = [NSMutableArray arrayWithObjects:S_SORT_NAME, S_SORT_MTIME, nil];
     } else if (_directory.editable) {
-        titles = [NSMutableArray arrayWithObjects:S_DOWNLOAD, S_EDIT, S_NEWFILE, S_MKDIR, S_SORT_NAME, S_SORT_MTIME, S_PHOTOS_ALBUM, nil];
+        titles = [NSMutableArray arrayWithObjects:S_EDIT, S_NEWFILE, S_MKDIR, S_SORT_NAME, S_SORT_MTIME, S_PHOTOS_ALBUM, nil];
         if (self.photos.count >= 3) [titles addObject:S_PHOTOS_BROWSER];
     } else {
-        titles = [NSMutableArray arrayWithObjects:S_DOWNLOAD, S_SORT_NAME, S_SORT_MTIME, S_PHOTOS_ALBUM, nil];
+        titles = [NSMutableArray arrayWithObjects:S_SORT_NAME, S_SORT_MTIME, S_PHOTOS_ALBUM, nil];
         if (self.photos.count >= 3) [titles addObject:S_PHOTOS_BROWSER];
     }
     [self showAlertWithAction:titles fromBarItem:self.editItem withTitle:nil];
@@ -419,20 +434,30 @@ enum {
     return _directory;
 }
 
+- (void)hideSearchBar:(SeafConnection *)conn
+{
+    if (conn.isSearchEnabled) {
+        self.tableView.tableHeaderView = self.searchBar;
+    } else {
+        self.tableView.tableHeaderView = nil;
+    }
+    self.searchDisplayController.active = NO;
+}
+
 - (void)setDirectory:(SeafDir *)directory
 {
-    if (!_directory) [self initNavigationItems:directory];
+    [self hideSearchBar:directory->connection];
+    [self initNavigationItems:directory];
 
-    _connection = directory->connection;
     _directory = directory;
+    _connection = directory->connection;
     self.title = directory.name;
-    [_directory loadContent:NO];
-    Debug("%@, %@, %@, loading ... %d %@\n", _directory.repoId, _directory.name, _directory.path, _directory.hasCache, _directory.ooid);
+    [_directory loadContent:false];
+    Debug("repoId:%@, %@, path:%@, loading ... cached:%d %@, editable:%d\n", _directory.repoId, _directory.name, _directory.path, _directory.hasCache, _directory.ooid, _directory.editable);
     if (![_directory isKindOfClass:[SeafRepos class]])
         self.tableView.sectionHeaderHeight = 0;
-    [_connection checkSyncDst:_directory];
-
     [_directory setDelegate:self];
+    [self refreshView];
 }
 
 - (void)viewWillLayoutSubviews {
@@ -451,24 +476,19 @@ enum {
     if (uploadFiles.count > 0)
         Debug("Upload %lu, state=%d", (unsigned long)uploadFiles.count, self.state);
 #endif
-    dispatch_time_t time = dispatch_time(DISPATCH_TIME_NOW, 1);
-    dispatch_after(time, dispatch_get_main_queue(), ^(void){
-        for (SeafUploadFile *file in uploadFiles) {
-            file.delegate = self;
-            if (!file.uploaded && !file.uploading) {
-                Debug("background upload %@", file.name);
-                [[SeafGlobal sharedObject] addUploadTask:file];
-            }
+    for (SeafUploadFile *file in uploadFiles) {
+        file.delegate = self;
+        if (!file.uploaded && !file.uploading) {
+            Debug("background upload %@", file.name);
+            [[SeafGlobal sharedObject] addUploadTask:file];
         }
-        if ([self isViewLoaded])
-            [_directory loadContent:true];
-    });
-
+    }
 }
 - (void)viewWillAppear:(BOOL)animated
 {
     [super viewWillAppear:animated];
-    [self performSelectorInBackground:@selector(checkUploadfiles) withObject:nil];
+    [self checkUploadfiles];
+    [_directory loadContent:true];
 }
 
 - (void)viewWillDisappear:(BOOL)animated
@@ -509,88 +529,57 @@ enum {
     return repos.count;
 }
 
-- (UITableViewCell *)getCell:(NSString *)CellIdentifier forTableView:(UITableView *)tableView
+- (SeafCell *)getCell:(NSString *)CellIdentifier forTableView:(UITableView *)tableView
 {
-    SWTableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:CellIdentifier];
+    SeafCell *cell = [tableView dequeueReusableCellWithIdentifier:CellIdentifier];
     if (cell == nil) {
         NSArray *cells = [[NSBundle mainBundle] loadNibNamed:CellIdentifier owner:self options:nil];
         cell = [cells objectAtIndex:0];
     }
+    [cell reset];
     if (tableView == self.tableView) {
         cell.rightUtilityButtons = [self rightButtons];
         cell.delegate = self;
-    } else {
-        cell.rightUtilityButtons = nil;
-        cell.delegate = nil;
     }
     return cell;
 }
 
-- (UIAlertController *)generateAction:(NSArray *)arr withTitle:(NSString *)title
+- (SeafCell *)getCellForTableView:(UITableView *)tableView
 {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:title message:nil preferredStyle:UIAlertControllerStyleActionSheet];
-    for (NSString *name in arr) {
-        UIAlertAction *action = [UIAlertAction actionWithTitle:name style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-            [self handleAction:name];
-        }];
-        [alert addAction:action];
-    }
-    if (!IsIpad()){
-        UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:STR_CANCEL style:UIAlertActionStyleCancel handler:^(UIAlertAction *action) {
-        }];
-        [alert addAction:cancelAction];
-    }
-    return alert;
+    return [self getCell:@"SeafCell" forTableView:tableView];
 }
 
 - (void)showAlertWithAction:(NSArray *)arr fromRect:(CGRect)rect inView:(UIView *)view withTitle:(NSString *)title
 {
-    if (ios8) {
-        UIAlertController *alert = [self generateAction:arr withTitle:title];
-        alert.popoverPresentationController.sourceView = self.view;
-        alert.popoverPresentationController.sourceRect = rect;
-        [self presentViewController:alert animated:true completion:nil];
-    } else {
-        if (self.actionSheet) {
-            [self.actionSheet dismissWithClickedButtonIndex:-1 animated:NO];
-            self.actionSheet = nil;
-        }
-        self.actionSheet = [[UIActionSheet alloc] initWithTitle:nil delegate:self cancelButtonTitle:actionSheetCancelTitle() destructiveButtonTitle:nil otherButtonTitles:nil];
-        for (NSString *title in arr) {
-            [self.actionSheet addButtonWithTitle:title];
-        }
-        [self.actionSheet showFromRect:rect inView:view animated:YES];
-    }
+    UIAlertController *alert = [self generateAlert:arr withTitle:title handler:^(UIAlertAction *action) {
+        [self handleAction:action.title];
+    }];
+    alert.popoverPresentationController.sourceRect = rect;
+    [self presentViewController:alert animated:true completion:nil];
 }
 
 - (void)showAlertWithAction:(NSArray *)arr fromBarItem:(UIBarButtonItem *)item withTitle:(NSString *)title
 {
-    if (ios8) {
-        UIAlertController *alert = [self generateAction:arr withTitle:title];
-        alert.popoverPresentationController.sourceView = self.view;
-        alert.popoverPresentationController.barButtonItem = item;
-        [self presentViewController:alert animated:true completion:nil];
-    }  else {
-        if (self.actionSheet) {
-            [self.actionSheet dismissWithClickedButtonIndex:-1 animated:NO];
-            self.actionSheet = nil;
-        }
-        self.actionSheet = [[UIActionSheet alloc] initWithTitle:title delegate:self cancelButtonTitle:actionSheetCancelTitle() destructiveButtonTitle:nil otherButtonTitles:nil];
-        for (NSString *title in arr) {
-            [self.actionSheet addButtonWithTitle:title];
-        }
-        [SeafAppDelegate showActionSheet:self.actionSheet fromBarButtonItem:item];
-    }
+    UIAlertController *alert = [self generateAlert:arr withTitle:title handler:^(UIAlertAction *action) {
+        [self handleAction:action.title];
+    }];
+    alert.popoverPresentationController.barButtonItem = item;
+    [self presentViewController:alert animated:true completion:nil];
 }
+
 - (void)showActionSheetForCell:(UITableViewCell *)cell
 {
     id entry = [self getDentrybyIndexPath:_selectedindex tableView:self.tableView];
     if ([entry isKindOfClass:[SeafRepo class]]) {
         SeafRepo *repo = (SeafRepo *)entry;
-        if (repo.encrypted)
-            [self showAlertWithAction:[NSArray arrayWithObjects:S_RESET_PASSWORD, nil] fromRect:cell.frame inView:self.tableView withTitle:nil];
+        NSMutableArray *titles = [[NSMutableArray alloc] init];
+        [titles addObject:S_DOWNLOAD];
+        if (repo.encrypted) {
+            [titles addObject:S_RESET_PASSWORD];
+        }
+        [self showAlertWithAction:titles fromRect:cell.frame inView:self.tableView withTitle:nil];
     } else if ([entry isKindOfClass:[SeafDir class]]) {
-        [self showAlertWithAction:[NSArray arrayWithObjects:S_DELETE, S_RENAME, S_SHARE_EMAIL, S_SHARE_LINK, nil] fromRect:cell.frame inView:self.tableView withTitle:nil];
+        [self showAlertWithAction:[NSArray arrayWithObjects:S_DOWNLOAD, S_DELETE, S_RENAME, S_SHARE_EMAIL, S_SHARE_LINK, nil] fromRect:cell.frame inView:self.tableView withTitle:nil];
     } else if ([entry isKindOfClass:[SeafFile class]]) {
         SeafFile *file = (SeafFile *)entry;
         NSArray *titles;
@@ -622,22 +611,15 @@ enum {
 - (UITableViewCell *)getSeafUploadFileCell:(SeafUploadFile *)file forTableView:(UITableView *)tableView
 {
     file.delegate = self;
-    SWTableViewCell *c;
+    SeafCell *cell = [self getCellForTableView:tableView];
+    cell.textLabel.text = file.name;
+    cell.imageView.image = file.icon;
     if (file.uploading) {
-        SeafUploadingFileCell *cell = (SeafUploadingFileCell *)[self getCell:@"SeafUploadingFileCell" forTableView:tableView];
-        cell.nameLabel.text = file.name;
-        cell.imageView.image = file.icon;
+        cell.progressView.hidden = false;
         [cell.progressView setProgress:file.uProgress * 1.0/100];
-        c = cell;
     } else {
-        SeafCell *cell = (SeafCell *)[self getCell:@"SeafCell" forTableView:tableView];
-        cell.textLabel.text = file.name;
-        cell.imageView.image = file.icon;
-        cell.badgeLabel.text = nil;
-
         NSString *sizeStr = [FileSizeFormatter stringFromLongLong:file.filesize];
         NSDictionary *dict = [file uploadAttr];
-        cell.accessoryView = nil;
         if (dict) {
             int utime = [[dict objectForKey:@"utime"] intValue];
             BOOL result = [[dict objectForKey:@"result"] boolValue];
@@ -649,10 +631,9 @@ enum {
         } else {
             cell.detailTextLabel.text = [NSString stringWithFormat:NSLocalizedString(@"%@, waiting to upload", @"Seafile"), sizeStr];
         }
-        c = cell;
-        [self updateCellDownloadStatus:cell isDownloading:false waiting:false cached:true];
+        [self updateCellDownloadStatus:cell isDownloading:false waiting:false cached:false];
     }
-    return c;
+    return cell;
 }
 
 - (void)updateCellDownloadStatus:(SeafCell *)cell file:(SeafFile *)sfile waiting:(BOOL)waiting
@@ -662,7 +643,8 @@ enum {
 
 - (void)updateCellDownloadStatus:(SeafCell *)cell isDownloading:(BOOL )isDownloading waiting:(BOOL)waiting cached:(BOOL)cached
 {
-    //Debug("... %d %d %d", cached, waiting, isDownloading);
+    if (!cell) return;
+    //Debug("... cached:%d %d %d", cached, waiting, isDownloading);
     dispatch_async(dispatch_get_main_queue(), ^{
         if (cached || waiting || isDownloading) {
             cell.cacheStatusView.hidden = false;
@@ -696,11 +678,14 @@ enum {
 - (SeafCell *)getSeafFileCell:(SeafFile *)sfile forTableView:(UITableView *)tableView
 {
     [sfile loadCache];
-    SeafCell *cell = (SeafCell *)[self getCell:@"SeafCell" forTableView:tableView];
+    SeafCell *cell = [self getCellForTableView:tableView];
     [self updateCellContent:cell file:sfile];
     sfile.delegate = self;
     sfile.udelegate = self;
-
+    if (tableView != self.tableView) {// For search results
+        SeafRepo *repo = [_connection getRepo:sfile.repoId];
+        cell.detailTextLabel.text = [NSString stringWithFormat:@"%@%@, %@", repo.name, sfile.path.stringByDeletingLastPathComponent, sfile.detailText];
+    }
     return cell;
 }
 
@@ -708,7 +693,7 @@ enum {
 {
     SeafCell *cell = (SeafCell *)[self getCell:@"SeafDirCell" forTableView:tableView];
     cell.textLabel.text = sdir.name;
-    cell.detailTextLabel.text = nil;
+    cell.detailTextLabel.text = @"";
     cell.imageView.image = sdir.icon;
     sdir.delegate = self;
     return cell;
@@ -716,20 +701,14 @@ enum {
 
 - (SeafCell *)getSeafRepoCell:(SeafRepo *)srepo forTableView:(UITableView *)tableView
 {
-    SeafCell *cell = (SeafCell *)[self getCell:@"SeafCell" forTableView:tableView];
-    NSString *detail = [SeafDateFormatter stringFromLongLong:srepo.mtime];
-    if ([SHARE_REPO isEqualToString:srepo.type]) {
-        detail = [detail stringByAppendingFormat:@", %@", srepo.owner];
-    }
-    cell.detailTextLabel.text = detail;
+    SeafCell *cell = [self getCellForTableView:tableView];
+    cell.detailTextLabel.text = srepo.detailText;
     cell.imageView.image = srepo.icon;
     cell.textLabel.text = srepo.name;
-    cell.badgeLabel.text = nil;
-    cell.cacheStatusView.hidden = true;
     [cell.cacheStatusWidthConstraint setConstant:0.0f];
     srepo.delegate = self;
-    if (tableView == self.tableView && srepo.encrypted) {
-        [cell setRightUtilityButtons:[self repoButtons] WithButtonWidth:100];
+    if (tableView == self.tableView) {
+        [cell setRightUtilityButtons:[self repoButtons:srepo] WithButtonWidth:100];
     } else {
         cell.rightUtilityButtons = nil;
     }
@@ -743,6 +722,7 @@ enum {
     if (!entry) return [[UITableViewCell alloc] init];
 
     if (tableView != self.tableView) {
+        // For search results.
         return [self getSeafFileCell:(SeafFile *)entry forTableView:tableView];
     }
     if ([entry isKindOfClass:[SeafRepo class]]) {
@@ -784,24 +764,13 @@ enum {
 
 - (void)popupSetRepoPassword:(SeafRepo *)repo
 {
-    [repo setDelegate:self];
     self.state = STATE_PASSWORD;
-    [self popupInputView:NSLocalizedString(@"Password of this library", @"Seafile") placeholder:nil secure:true handler:^(NSString *input) {
-        if (!input || input.length == 0) {
-            [self alertWithTitle:NSLocalizedString(@"Password must not be empty", @"Seafile")handler:^{
-                [self popupSetRepoPassword:repo];
-            }];
-            return;
-        }
-        if (input.length < 3 || input.length  > 100) {
-            [self alertWithTitle:NSLocalizedString(@"The length of password should be between 3 and 100", @"Seafile") handler:^{
-                [self popupSetRepoPassword:repo];
-            }];
-            return;
-        }
-        [SVProgressHUD showWithStatus:NSLocalizedString(@"Checking library password ...", @"Seafile")];
-        [repo setDelegate:self];
-        [repo checkOrSetRepoPassword:input delegate:self];
+    [self popupSetRepoPassword:repo handler:^{
+            [SVProgressHUD dismiss];
+            self.state = STATE_INIT;
+            SeafFileViewController *controller = [[UIStoryboard storyboardWithName:@"FolderView_iPad" bundle:nil] instantiateViewControllerWithIdentifier:@"MASTERVC"];
+            [self.navigationController pushViewController:controller animated:YES];
+            [controller setDirectory:(SeafDir *)repo];
     }];
 }
 
@@ -866,7 +835,7 @@ enum {
 
     UINavigationController *navController = [[UINavigationController alloc] initWithRootViewController:controller];
     [navController setModalPresentationStyle:UIModalPresentationFormSheet];
-    [appdelegate.tabbarController presentViewController:navController animated:YES completion:nil];
+    [appdelegate.window.rootViewController presentViewController:navController animated:YES completion:nil];
     if (IsIpad()) {
         CGRect frame = navController.view.superview.frame;
         navController.view.superview.frame = CGRectMake(frame.origin.x+frame.size.width/2-320/2, frame.origin.y+frame.size.height/2-500/2, 320, 500);
@@ -913,6 +882,7 @@ enum {
         return [self noneSelected:NO];
     }
     _curEntry = [self getDentrybyIndexPath:indexPath tableView:tableView];
+    Debug("Select %@", _curEntry.name);
     if (!_curEntry) {
         return [self.tableView performSelector:@selector(reloadData) withObject:nil afterDelay:0.1];
     }
@@ -923,7 +893,7 @@ enum {
     if ([_curEntry conformsToProtocol:@protocol(SeafPreView)]) {
         if ([_curEntry isKindOfClass:[SeafFile class]] && ![(SeafFile *)_curEntry hasCache]) {
             SeafCell *cell = [tableView cellForRowAtIndexPath:indexPath];
-            if (cell) [self updateCellDownloadStatus:cell file:(SeafFile *)_curEntry waiting:true];
+            [self updateCellDownloadStatus:cell file:(SeafFile *)_curEntry waiting:true];
         }
         if (!IsIpad()) {
             SeafAppDelegate *appdelegate = (SeafAppDelegate *)[[UIApplication sharedApplication] delegate];
@@ -970,15 +940,20 @@ enum {
         if (!repo) {
             text = @"";
         } else if ([repo.type isEqualToString:SHARE_REPO]) {
-            text = NSLocalizedString(@"Private Shares", @"Seafile");
+            text = NSLocalizedString(@"Shared to me", @"Seafile");
         } else {
-            text = repo.owner;
+            if ([repo.owner isEqualToString:ORG_REPO]) {
+                text = NSLocalizedString(@"Organization", @"Seafile");
+            } else {
+                text = repo.owner;
+            }
         }
     }
     UIView *headerView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, tableView.bounds.size.width, 30)];
     UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(10, 3, tableView.bounds.size.width - 10, 18)];
+    label.font = [UIFont systemFontOfSize:14];
     label.text = text;
-    label.textColor = [UIColor whiteColor];
+    label.textColor = [UIColor darkTextColor];
     label.backgroundColor = [UIColor clearColor];
     [headerView setBackgroundColor:HEADER_COLOR];
     [headerView addSubview:label];
@@ -1003,8 +978,8 @@ enum {
         [self.detailViewController download:entry progress:progress];
         SeafPhoto *photo = [self getSeafPhoto:(id<SeafPreView>)entry];
         [photo setProgress:progress];
-        SeafCell *cell = (SeafCell *)[self getEntryCell:(SeafFile *)entry indexPath:nil];
-        if (cell) [self updateCellDownloadStatus:cell file:(SeafFile *)entry waiting:false];
+        SeafCell *cell = [self getEntryCell:(SeafFile *)entry indexPath:nil];
+        [self updateCellDownloadStatus:cell file:(SeafFile *)entry waiting:false];
     }
 }
 
@@ -1028,6 +1003,8 @@ enum {
         if (updated) {
             [self refreshView];
             [SeafAppDelegate checkOpenLink:self];
+        } else {
+            //[self.tableView reloadData];
         }
         self.state = STATE_INIT;
     }
@@ -1086,69 +1063,12 @@ enum {
     }
 }
 
-- (void)entry:(SeafBase *)entry repoPasswordSet:(int)ret;
-{
-    if (entry != _curEntry)  return;
-
-    NSAssert([entry isKindOfClass:[SeafRepo class]], @"entry must be a repo\n");
-    if (ret == RET_SUCCESS) {
-        [SVProgressHUD dismiss];
-        self.state = STATE_INIT;
-        SeafFileViewController *controller = [[UIStoryboard storyboardWithName:@"FolderView_iPad" bundle:nil] instantiateViewControllerWithIdentifier:@"MASTERVC"];
-        [self.navigationController pushViewController:controller animated:YES];
-        [controller setDirectory:(SeafDir *)entry];
-    } else {
-        [SVProgressHUD showErrorWithStatus:NSLocalizedString(@"Wrong library password", @"Seafile")];
-        [self performSelector:@selector(popupSetRepoPassword:) withObject:entry afterDelay:1.0];
-    }
-}
-
 - (void)doneLoadingTableViewData
 {
-    [_refreshHeaderView egoRefreshScrollViewDataSourceDidFinishedLoading:self.tableView];
-}
-
-#pragma mark - mark UIScrollViewDelegate Methods
-- (void)scrollViewDidScroll:(UIScrollView *)scrollView
-{
-    if (!self.searchDisplayController.active)
-        [_refreshHeaderView egoRefreshScrollViewDidScroll:scrollView];
-}
-
-- (void)scrollViewDidEndDragging:(UIScrollView *)scrollView willDecelerate:(BOOL)decelerate
-{
-    if (!self.searchDisplayController.active)
-        [_refreshHeaderView egoRefreshScrollViewDidEndDragging:scrollView];
-}
-
-#pragma mark - EGORefreshTableHeaderDelegate Methods
-- (void)egoRefreshTableHeaderDidTriggerRefresh:(EGORefreshTableHeaderView*)view
-{
-    if (self.searchDisplayController.active)
-        return;
-    SeafAppDelegate *appdelegate = (SeafAppDelegate *)[[UIApplication sharedApplication] delegate];
-    if (![appdelegate checkNetworkStatus]) {
-        [self performSelector:@selector(doneLoadingTableViewData) withObject:nil afterDelay:0.1];
-        return;
-    }
-
-    _directory.delegate = self;
-    [_directory loadContent:YES];
-}
-
-- (BOOL)egoRefreshTableHeaderDataSourceIsLoading:(EGORefreshTableHeaderView*)view
-{
-    return [_directory state] == SEAF_DENTRY_LOADING;
-}
-
-- (NSDate*)egoRefreshTableHeaderDataSourceLastUpdated:(EGORefreshTableHeaderView*)view
-{
-    return [NSDate date];
+    [self.tableView.pullToRefreshView stopAnimating];
 }
 
 #pragma mark - edit files
-
-
 - (void)editOperation:(id)sender
 {
     SeafAppDelegate *appdelegate = (SeafAppDelegate *)[[UIApplication sharedApplication] delegate];
@@ -1181,6 +1101,7 @@ enum {
                 [entries addObject:[_directory.allItems objectAtIndex:indexPath.row]];
             }
             self.state = STATE_DELETE;
+            _directory.delegate = self;
             [_directory delEntries:entries];
             [SVProgressHUD showWithStatus:NSLocalizedString(@"Deleting files ...", @"Seafile")];
             break;
@@ -1195,6 +1116,7 @@ enum {
     NSArray *entries = [NSArray arrayWithObject:file];
     self.state = STATE_DELETE;
     [SVProgressHUD showWithStatus:NSLocalizedString(@"Deleting file ...", @"Seafile")];
+    _directory.delegate = self;
     [_directory delEntries:entries];
 }
 
@@ -1203,11 +1125,13 @@ enum {
     NSArray *entries = [NSArray arrayWithObject:dir];
     self.state = STATE_DELETE;
     [SVProgressHUD showWithStatus:NSLocalizedString(@"Deleting directory ...", @"Seafile")];
+    _directory.delegate = self;
     [_directory delEntries:entries];
 }
 
 - (void)redownloadFile:(SeafFile *)file
 {
+    [file cancelAnyLoading];
     [file deleteCache];
     [self.detailViewController setPreViewItem:nil master:nil];
     [self tableView:self.tableView didSelectRowAtIndexPath:_selectedindex];
@@ -1220,17 +1144,36 @@ enum {
     [_connection performSelectorInBackground:@selector(downloadDir:) withObject:dir];
 }
 
+- (void)downloadRepo:(SeafRepo *)repo
+{
+    Debug("download repo: %@ %@", repo.repoId, repo.path);
+    [SVProgressHUD showSuccessWithStatus:[NSLocalizedString(@"Start to download library: ", @"Seafile") stringByAppendingString:repo.name]];
+    [_connection performSelectorInBackground:@selector(downloadDir:) withObject:repo];
+}
+
 - (void)savePhotosToAlbum
 {
+    SeafFileDidDownloadBlock block = ^(SeafFile *file, BOOL result) {
+        if (!result) {
+            return Warning("Failed to donwload file %@", file.path);
+        }
+        [file setFileDownloadedBlock:nil];
+        Debug("Save file %@ %@ to album", file.name, file.cachePath);
+        UIImage *img = [UIImage imageWithContentsOfFile:file.cachePath];
+        UIImageWriteToSavedPhotosAlbum(img, self, @selector(thisImage:hasBeenSavedInPhotoAlbumWithError:usingContextInfo:), (void *)CFBridgingRetain(file));
+    };
     for (id entry in _directory.allItems) {
         if (![entry isKindOfClass:[SeafFile class]]) continue;
         SeafFile *file = (SeafFile *)entry;
         if (!file.isImageFile) continue;
+        [file loadCache];
         NSString *path = file.cachePath;
-        if (!path) continue;
-        Debug("Save file %@ %@ to album", file.name, path);
-        UIImage *img = [UIImage imageWithContentsOfFile:path];
-        UIImageWriteToSavedPhotosAlbum(img, self, @selector(thisImage:hasBeenSavedInPhotoAlbumWithError:usingContextInfo:), (void *)CFBridgingRetain(file));
+        if (!path) {
+            [file setFileDownloadedBlock:block];
+            [SeafGlobal.sharedObject addDownloadTask:file];
+        } else {
+            block(file, true);
+        }
     }
     [SVProgressHUD showSuccessWithStatus:S_PHOTOS_ALBUM];
 }
@@ -1285,7 +1228,6 @@ enum {
     });
 }
 
-#pragma mark - UIActionSheetDelegate
 - (void)deleteEntry:(id)entry
 {
     self.state = STATE_DELETE;
@@ -1299,6 +1241,7 @@ enum {
     else if ([entry isKindOfClass:[SeafDir class]])
         [self deleteDir: (SeafDir*)entry];
 }
+
 - (void)handleAction:(NSString *)title
 {
     Debug("handle action title:%@, %@", title, _selectedCell);
@@ -1312,7 +1255,8 @@ enum {
     } else if ([S_MKDIR isEqualToString:title]) {
         [self popupMkdirView];
     } else if ([S_DOWNLOAD isEqualToString:title]) {
-        [self downloadDir:_directory];
+        SeafDir *dir = (SeafDir *)[self getDentrybyIndexPath:_selectedindex tableView:self.tableView];
+        [self downloadDir:dir];
     } else if ([S_PHOTOS_ALBUM isEqualToString:title]) {
         [self savePhotosToAlbum];
     } else if ([S_PHOTOS_BROWSER isEqualToString:title]) {
@@ -1368,16 +1312,11 @@ enum {
         SeafRepo *repo = (SeafRepo *)[self getDentrybyIndexPath:_selectedindex tableView:self.tableView];
         [repo->connection setRepo:repo.repoId password:nil];
         [self popupSetRepoPassword:repo];
+    } else if ([S_CLEAR_REPO_PASSWORD isEqualToString:title]) {
+        SeafRepo *repo = (SeafRepo *)[self getDentrybyIndexPath:_selectedindex tableView:self.tableView];
+        [repo->connection setRepo:repo.repoId password:nil];
+        [SVProgressHUD showSuccessWithStatus:NSLocalizedString(@"Clear library password successfully.", @"Seafile")];
     }
-}
-
-- (void)actionSheet:(UIActionSheet *)actionSheet clickedButtonAtIndex:(NSInteger)buttonIndex
-{
-    self.actionSheet = nil;
-    if (buttonIndex < 0 || buttonIndex >= actionSheet.numberOfButtons)
-        return;
-    NSString *title = [actionSheet buttonTitleAtIndex:buttonIndex];
-    [self handleAction:title];
 }
 
 - (void)backgroundUpload:(SeafUploadFile *)ufile
@@ -1559,23 +1498,13 @@ enum {
 }
 
 #pragma mark - SeafFileUpdateDelegate
-- (void)updateProgress:(SeafFile *)file result:(BOOL)res completeness:(int)percent
+- (void)updateProgress:(SeafFile *)file progress:(int)percent
 {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        @try {
-            NSIndexPath *indexPath = nil;
-            SeafCell *cell = (SeafCell *)[self getEntryCell:file indexPath:&indexPath];
-            if (res && cell) {
-                if ([cell isKindOfClass:[SeafUploadingFileCell class]]) {
-                    [((SeafUploadingFileCell *)cell).progressView setProgress:percent*1.0f/100];
-                } else {
-                    [self updateCellContent:(SeafCell *)cell file:file];
-                }
-            } else if (indexPath)
-                [self reloadIndex:indexPath];
-        } @catch(NSException *exception) {
-        }
-    });
+    [self updateEntryCell:file];
+}
+- (void)updateComplete:(nonnull SeafFile * )file result:(BOOL)res
+{
+    [self updateEntryCell:file];
 }
 
 #pragma mark - SeafUploadDelegate
@@ -1583,30 +1512,33 @@ enum {
 {
     dispatch_async(dispatch_get_main_queue(), ^{
         NSIndexPath *indexPath = nil;
-        UITableViewCell *cell = [self getEntryCell:file indexPath:&indexPath];
+        SeafCell *cell = [self getEntryCell:file indexPath:&indexPath];
         if (!cell) return;
-        if (!completed && res && [cell isKindOfClass:[SeafUploadingFileCell class]]) {
-            [((SeafUploadingFileCell *)cell).progressView setProgress:percent*1.0f/100];
+        if (!completed && res) {
+            [cell.progressView setProgress:percent*1.0f/100];
         } else if (indexPath) {
             [self reloadIndex:indexPath];
         }
     });
 }
 
-- (void)uploadProgress:(SeafUploadFile *)file result:(BOOL)res progress:(int)percent
+- (void)uploadProgress:(SeafUploadFile *)file progress:(int)percent
 {
-    [self updateFileCell:file result:res progress:percent completed:false];
+    [self updateFileCell:file result:true progress:percent completed:false];
 }
 
-- (void)uploadSucess:(SeafUploadFile *)file oid:(NSString *)oid
+- (void)uploadComplete:(BOOL)success file:(SeafUploadFile *)file oid:(NSString *)oid
 {
+    if (!success) {
+        return [self updateFileCell:file result:false progress:0 completed:true];
+    }
     [self updateFileCell:file result:YES progress:100 completed:YES];
     if (self.isVisible) {
         [SVProgressHUD showSuccessWithStatus:[NSString stringWithFormat:NSLocalizedString(@"File '%@' uploaded success", @"Seafile"), file.name]];
     }
 }
 
-#pragma mark - Search Delegate
+#pragma mark - UISearchDisplayDelegate
 #define SEARCH_STATE_INIT NSLocalizedString(@"Click \"Search\" to start", @"Seafile")
 #define SEARCH_STATE_SEARCHING NSLocalizedString(@"Searching", @"Seafile")
 #define SEARCH_STATE_NORESULTS NSLocalizedString(@"No Results", @"Seafile")
@@ -1639,7 +1571,7 @@ enum {
 {
     self.searchResults = nil;
     if ([_directory isKindOfClass:[SeafRepos class]]) {
-        self.tableView.sectionHeaderHeight = 22;
+        self.tableView.sectionHeaderHeight = HEADER_HEIGHT;
         [self.tableView reloadData];
     }
 }
@@ -1657,12 +1589,14 @@ enum {
     [self setSearchState:controller state:SEARCH_STATE_INIT];
 }
 
+#pragma mark - UISearchBarDelegate
 - (void)searchBarSearchButtonClicked:(UISearchBar *)searchBar
 {
     Debug("search %@", searchBar.text);
     [self setSearchState:self.searchDisplayController state:SEARCH_STATE_SEARCHING];
     [SVProgressHUD showWithStatus:NSLocalizedString(@"Searching ...", @"Seafile")];
-    [_connection search:searchBar.text success:^(NSURLRequest *request, NSHTTPURLResponse *response, id JSON, NSMutableArray *results) {
+    NSString *repoId = [_directory isKindOfClass:[SeafRepos class]] ? nil : _directory.repoId;
+    [_connection search:searchBar.text repo:repoId success:^(NSURLRequest *request, NSHTTPURLResponse *response, id JSON, NSMutableArray *results) {
         [SVProgressHUD dismiss];
         if (results.count == 0)
             [self setSearchState:self.searchDisplayController state:SEARCH_STATE_NORESULTS];
@@ -1686,7 +1620,7 @@ enum {
     [self.tableView selectRowAtIndexPath:indexPath animated:NO scrollPosition:UITableViewScrollPositionMiddle];
 }
 
-- (UITableViewCell *)getEntryCell:(id)entry indexPath:(NSIndexPath **)indexPath
+- (SeafCell *)getEntryCell:(id)entry indexPath:(NSIndexPath **)indexPath
 {
     NSUInteger index = [_directory.allItems indexOfObject:entry];
     if (index == NSNotFound)
@@ -1694,7 +1628,7 @@ enum {
     @try {
         NSIndexPath *path = [NSIndexPath indexPathForRow:index inSection:0];
         if (indexPath) *indexPath = path;
-        return [self.tableView cellForRowAtIndexPath:path];
+        return (SeafCell *)[self.tableView cellForRowAtIndexPath:path];
     } @catch(NSException *exception) {
         return nil;
     }
@@ -1704,8 +1638,8 @@ enum {
 {
     dispatch_async(dispatch_get_main_queue(), ^{
         @try {
-            SeafCell *cell = (SeafCell *)[self getEntryCell:entry indexPath:nil];
-            if (cell) [self updateCellContent:cell file:entry];
+            SeafCell *cell = [self getEntryCell:entry indexPath:nil];
+            [self updateCellContent:cell file:entry];
         } @catch(NSException *exception) {
         }
     });
@@ -1805,19 +1739,23 @@ enum {
     if (!_selectedindex)
         return;
     SeafBase *base = (SeafBase *)[self getDentrybyIndexPath:_selectedindex tableView:self.tableView];
-    if (index == 0) {
-        if ([base isKindOfClass:[SeafRepo class]]) {
-            SeafRepo *repo = (SeafRepo *)base;
+    if ([base isKindOfClass:[SeafRepo class]]) {
+        SeafRepo *repo = (SeafRepo *)base;
+       if (index == 0) {
+           [self downloadRepo:repo];
+        } else {
             [repo->connection setRepo:repo.repoId password:nil];
             [SVProgressHUD showSuccessWithStatus:NSLocalizedString(@"Clear library password successfully.", @"Seafile")];
-            [self performSelector:@selector(hideCellButton:) withObject:cell afterDelay:0.1f];
-        } else {
+        }
+        [self performSelector:@selector(hideCellButton:) withObject:cell afterDelay:0.1f];
+    } else {
+        if (index == 0) {// More
             _selectedCell = cell;
             [self showActionSheetForCell:cell];
+            [self.tableView selectRowAtIndexPath:_selectedindex animated:true scrollPosition:UITableViewScrollPositionNone];
+        } else { // Delete
+            [self deleteEntry:base];
         }
-        [self.tableView selectRowAtIndexPath:_selectedindex animated:true scrollPosition:UITableViewScrollPositionNone];
-    } else {
-        [self deleteEntry:base];
     }
 }
 
@@ -1834,12 +1772,17 @@ enum {
     return rightUtilityButtons;
 }
 
-- (NSArray *)repoButtons
+- (NSArray *)repoButtons:(SeafRepo *)repo
 {
     NSMutableArray *rightUtilityButtons = [NSMutableArray new];
     [rightUtilityButtons sw_addUtilityButtonWithColor:
      [UIColor colorWithRed:0.78f green:0.78f blue:0.8f alpha:1.0]
-                                                title:S_CLEAR_REPO_PASSWORD];
+                                                title:S_DOWNLOAD];
+    if (repo.encrypted) {
+        [rightUtilityButtons sw_addUtilityButtonWithColor:
+         [UIColor colorWithRed:1.0f green:0.231f blue:0.188 alpha:1.0f]
+                                                    title:S_CLEAR_REPO_PASSWORD];
+    }
     return rightUtilityButtons;
 }
 

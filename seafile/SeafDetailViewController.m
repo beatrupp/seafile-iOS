@@ -6,8 +6,8 @@
 //  Copyright (c) 2012 Seafile Ltd. All rights reserved.
 //
 
-#import <MWPhotoBrowser.h>
-#import <SVProgressHUD.h>
+#import "MWPhotoBrowser.h"
+#import "SVProgressHUD.h"
 
 #import "SeafAppDelegate.h"
 #import "SeafDetailViewController.h"
@@ -42,7 +42,7 @@ enum SHARE_STATUS {
 
 #define SHARE_TITLE NSLocalizedString(@"How would you like to share this file?", @"Seafile")
 
-@interface SeafDetailViewController ()<UIWebViewDelegate, UIActionSheetDelegate, UIPrintInteractionControllerDelegate, MFMailComposeViewControllerDelegate, QLPreviewControllerDelegate, QLPreviewControllerDataSource, MWPhotoBrowserDelegate>
+@interface SeafDetailViewController ()<UIWebViewDelegate, UIPrintInteractionControllerDelegate, MFMailComposeViewControllerDelegate, QLPreviewControllerDelegate, QLPreviewControllerDataSource, MWPhotoBrowserDelegate>
 @property (strong, nonatomic) UIPopoverController *masterPopoverController;
 
 @property (retain) QLPreviewController *fileViewController;
@@ -69,8 +69,6 @@ enum SHARE_STATUS {
 @property (strong) UIDocumentInteractionController *docController;
 @property int shareStatus;
 @property (readwrite, nonatomic) bool hideMaster;
-
-@property (strong) UIActionSheet *actionSheet;
 
 @end
 
@@ -144,7 +142,7 @@ enum SHARE_STATUS {
             if (![QLPreviewController canPreviewItem:self.preViewItem]) {
                 self.state = PREVIEW_FAILED;
             } else {
-                self.state = PREVIEW_SUCCESS;
+                self.state = ios10 ? PREVIEW_WEBVIEW : PREVIEW_SUCCESS;
                 if ([self.preViewItem.mime hasPrefix:@"audio"]
                     || [self.preViewItem.mime hasPrefix:@"video"]
                     || [self.preViewItem.mime isEqualToString:@"image/svg+xml"])
@@ -281,19 +279,22 @@ enum SHARE_STATUS {
         views = [[NSBundle mainBundle] loadNibNamed:@"DownloadingProgress_iPhone" owner:self options:nil];
         self.progressView = [views objectAtIndex:0];
     }
-    [self.progressView.cancelBt addTarget:self action:@selector(cancelDownload:) forControlEvents:UIControlEventTouchUpInside];
-    self.fileViewController = [[QLPreviewController alloc] init];
-    self.fileViewController.delegate = self;
-    self.fileViewController.dataSource = self;
     self.webView = [[UIWebView alloc] initWithFrame:self.view.frame];
     self.webView.scalesPageToFit = YES;
     self.webView.autoresizesSubviews = YES;
     self.webView.autoresizingMask = UIViewAutoresizingFlexibleHeight | UIViewAutoresizingFlexibleWidth;
     [self.view addSubview:self.failedView];
     [self.view addSubview:self.progressView];
-    [self.view addSubview:self.fileViewController.view];
     [self.view addSubview:self.webView];
 
+    self.fileViewController = [[QLPreviewController alloc] init];
+    self.fileViewController.delegate = self;
+    self.fileViewController.dataSource = self;
+    [self addChildViewController:self.fileViewController];
+    [self.view addSubview:self.fileViewController.view];
+    [self.fileViewController didMoveToParentViewController:self];
+
+    [self.progressView.cancelBt addTarget:self action:@selector(cancelDownload:) forControlEvents:UIControlEventTouchUpInside];
     [self.failedView.openElseBtn addTarget:self action:@selector(openElsewhere:) forControlEvents:UIControlEventTouchUpInside];
 
     self.view.autoresizesSubviews = YES;
@@ -419,18 +420,26 @@ enum SHARE_STATUS {
         if (photo == nil)
             return;
         [photo complete:updated error:nil];
+        [self updateNavigation];
         return;
     }
     if (_preViewItem != entry) return;
     [self refreshView];
 }
+
+- (void)showDownloadError:(NSString *)filename
+{
+    if (self.isVisible)
+        [SVProgressHUD showErrorWithStatus:[NSString stringWithFormat:NSLocalizedString(@"Failed to download file '%@'", @"Seafile"), self.preViewItem.previewItemTitle]];
+}
+
 - (void)download:(SeafBase *)entry failed:(NSError *)error
 {
     Debug("Failed to download %@ : %@ ", entry.name, error);
     if (self.state == PREVIEW_PHOTO) {
         SeafPhoto *photo = [self getSeafPhoto:(id<SeafPreView>)entry];
         if (photo == nil) return;
-        [SVProgressHUD showErrorWithStatus:[NSString stringWithFormat:@"Failed to download file '%@'",self.preViewItem.previewItemTitle]];
+        [self showDownloadError:self.preViewItem.previewItemTitle];
         NSError *error = [NSError errorWithDomain:[NSString stringWithFormat:@"Failed to download file '%@'",self.preViewItem.previewItemTitle] code:-1 userInfo:nil];
         [photo complete:false error:error];
         return;
@@ -438,7 +447,7 @@ enum SHARE_STATUS {
     if (self.preViewItem != entry || self.preViewItem.hasCache)
         return;
 
-    [SVProgressHUD showErrorWithStatus:[NSString stringWithFormat:@"Failed to download file '%@'", self.preViewItem.previewItemTitle]];
+    [self showDownloadError:self.preViewItem.previewItemTitle];
     [self setPreViewItem:nil master:nil];
 }
 
@@ -481,8 +490,9 @@ enum SHARE_STATUS {
 
 - (IBAction)cancelDownload:(id)sender
 {
-    [(SeafFile *)self.preViewItem cancelAnyLoading];
+    id<SeafPreView> item = self.preViewItem;
     [self setPreViewItem:nil master:nil];
+    [item cancelAnyLoading];
     if (!IsIpad())
         [self goBack:nil];
 }
@@ -501,41 +511,13 @@ enum SHARE_STATUS {
     }
 }
 
-- (UIAlertController *)generateAction:(NSArray *)arr withTitle:(NSString *)title
-{
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:title message:nil preferredStyle:UIAlertControllerStyleActionSheet];
-    for (NSString *name in arr) {
-        UIAlertAction *action = [UIAlertAction actionWithTitle:name style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-            [self handleAction:name];
-        }];
-        [alert addAction:action];
-    }
-    if (!IsIpad()){
-        UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:STR_CANCEL style:UIAlertActionStyleCancel handler:^(UIAlertAction *action) {
-        }];
-        [alert addAction:cancelAction];
-    }
-    return alert;
-}
-
 - (void)showAlertWithAction:(NSArray *)arr fromBarItem:(UIBarButtonItem *)item withTitle:(NSString *)title
 {
-    if (ios8) {
-        UIAlertController *alert = [self generateAction:arr withTitle:title];
-        alert.popoverPresentationController.sourceView = self.view;
-        alert.popoverPresentationController.barButtonItem = item;
-        [self presentViewController:alert animated:true completion:nil];
-    }  else {
-        if (self.actionSheet) {
-            [self.actionSheet dismissWithClickedButtonIndex:-1 animated:NO];
-            self.actionSheet = nil;
-        }
-        self.actionSheet = [[UIActionSheet alloc] initWithTitle:title delegate:self cancelButtonTitle:actionSheetCancelTitle() destructiveButtonTitle:nil otherButtonTitles:nil];
-        for (NSString *title in arr) {
-            [self.actionSheet addButtonWithTitle:title];
-        }
-        [SeafAppDelegate showActionSheet:self.actionSheet fromBarButtonItem:item];
-    }
+    UIAlertController *alert = [self generateAlert:arr withTitle:title handler:^(UIAlertAction *action) {
+        [self handleAction:action.title];
+    }];
+    alert.popoverPresentationController.barButtonItem = item;
+    [self presentViewController:alert animated:true completion:nil];
 }
 
 - (IBAction)export:(id)sender
@@ -620,13 +602,10 @@ enum SHARE_STATUS {
     }
 }
 
-#pragma mark - UIActionSheetDelegate
 - (void)handleAction:(NSString *)title
 {
-    SeafAppDelegate *appdelegate = (SeafAppDelegate *)[[UIApplication sharedApplication] delegate];
     SeafFile *file = (SeafFile *)self.preViewItem;
     if ([NSLocalizedString(@"Open elsewhere...", @"Seafile") isEqualToString:title]) {
-        if (self.actionSheet)[self.actionSheet dismissWithClickedButtonIndex:-1 animated:NO];
         [self performSelector:@selector(openElsewhere:) withObject:nil afterDelay:0.0f];
     } else if ([NSLocalizedString(@"Save to album", @"Seafile") isEqualToString:title]) {
         if ([Utils isImageFile:file.name]) {
@@ -644,10 +623,7 @@ enum SHARE_STATUS {
         [self printFile:file];
     } else if ([NSLocalizedString(@"Email", @"Seafile") isEqualToString:title]
                || [NSLocalizedString(@"Copy Link to Clipboard", @"Seafile") isEqualToString:title]) {
-        if (![appdelegate checkNetworkStatus])
-            return;
-        SeafAppDelegate *appdelegate = (SeafAppDelegate *)[[UIApplication sharedApplication] delegate];
-        if (![appdelegate checkNetworkStatus])
+        if (![self checkNetworkStatus])
             return;
 
         if ([NSLocalizedString(@"Email", @"Seafile") isEqualToString:title])
@@ -661,15 +637,6 @@ enum SHARE_STATUS {
             [self generateSharelink:file WithResult:YES];
         }
     }
-}
-- (void)actionSheet:(UIActionSheet *)actionSheet clickedButtonAtIndex:(NSInteger)bIndex
-{
-    self.actionSheet = nil;
-    if (bIndex < 0 || bIndex >= actionSheet.numberOfButtons)
-        return;
-
-    NSString *title = [actionSheet buttonTitleAtIndex:bIndex];
-    [self handleAction:title];
 }
 
 #pragma mark - SeafShareDelegate
@@ -801,7 +768,7 @@ enum SHARE_STATUS {
         _mwPhotoBrowser.backgroundColor = [UIColor whiteColor];
         _mwPhotoBrowser.trackTintColor = SEAF_COLOR_LIGHT;
         _mwPhotoBrowser.progressColor = SEAF_COLOR_DARK;
-        _mwPhotoBrowser.preLoadNum = 3;
+        _mwPhotoBrowser.preLoadNum = 2;
     }
     return _mwPhotoBrowser;
 }

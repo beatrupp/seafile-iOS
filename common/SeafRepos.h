@@ -9,6 +9,9 @@
 #import "SeafDir.h"
 
 #define SHARE_REPO @"srepo"
+#define GROUP_REPO @"grepo"
+
+#define ORG_REPO @"Organization"
 
 @interface SeafRepo : SeafDir<SeafSortable>
 @property (readonly) NSString *repoType;
@@ -17,7 +20,6 @@
 @property (readonly, copy) NSString *magic;
 @property (readonly, copy) NSString *encKey;
 @property (readonly) BOOL passwordRequired;
-@property (readonly) BOOL editable;
 @property (readwrite) BOOL encrypted;
 @property (readwrite) int encVersion;
 @property (readonly) unsigned long long size;
@@ -25,6 +27,9 @@
 @property (readonly) NSString *type;
 
 - (BOOL)canLocalDecrypt;
+- (NSString *)detailText;
+- (BOOL)isGroupRepo;
+
 
 @end
 

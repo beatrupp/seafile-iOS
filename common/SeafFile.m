@@ -10,6 +10,7 @@
 #import "SeafData.h"
 #import "SeafRepos.h"
 #import "SeafGlobal.h"
+#import "SeafThumb.h"
 
 #import "FileMimeType.h"
 #import "ExtentedString.h"
@@ -20,7 +21,6 @@
 #import "Utils.h"
 
 typedef void (^SeafThumbCompleteBlock)(BOOL ret);
-
 
 @interface SeafFile()
 
@@ -37,6 +37,7 @@ typedef void (^SeafThumbCompleteBlock)(BOOL ret);
 @property int index;
 
 @property (readwrite, nonatomic, copy) SeafThumbCompleteBlock thumbCompleteBlock;
+@property (readwrite, nonatomic, copy) SeafFileDidDownloadBlock fileDidDownload;
 
 @end
 
@@ -87,7 +88,7 @@ typedef void (^SeafThumbCompleteBlock)(BOOL ret);
 {
     if (!self.oid) return nil;
     int size = THUMB_SIZE * (int)[[UIScreen mainScreen] scale];
-    return [SeafGlobal.sharedObject.thumbsDir stringByAppendingFormat:@"%@-%d", objId, size];
+    return [SeafGlobal.sharedObject.thumbsDir stringByAppendingPathComponent:[NSString stringWithFormat:@"/%@-%d", objId, size]];
 }
 - (void)updateWithEntry:(SeafBase *)entry
 {
@@ -99,7 +100,7 @@ typedef void (^SeafThumbCompleteBlock)(BOOL ret);
     _mtime = file.mtime;
     self.state = SEAF_DENTRY_INIT;
     [self loadCache];
-    [self.delegate download:self complete:true];
+    [self downloadComplete:true];
 }
 
 - (void)setOoid:(NSString *)ooid
@@ -111,9 +112,13 @@ typedef void (^SeafThumbCompleteBlock)(BOOL ret);
 
 - (BOOL)isDownloading
 {
-    return self.downloadingFileOid != nil;
+    return self.downloadingFileOid != nil || self.state == SEAF_DENTRY_LOADING;
 }
 
+- (void)removeBlock:(NSString *)blkId
+{
+    [[NSFileManager defaultManager] removeItemAtPath:[SeafGlobal.sharedObject blockPath:blkId] error:nil];
+}
 - (void)clearDownloadContext
 {
     if (_progress) {
@@ -124,31 +129,32 @@ typedef void (^SeafThumbCompleteBlock)(BOOL ret);
     }
     self.downloadingFileOid = nil;
     self.task = nil;
+    self.index = 0;
+    for (int i = 0; i < self.blkids.count; ++i) {
+        [self removeBlock:[self.blkids objectAtIndex:i]];
+    }
+    self.blkids = nil;
 }
 
 - (void)finishDownload:(NSString *)ooid
 {
-    self.index = 0;
-    self.blkids = nil;
     [self clearDownloadContext];
     [SeafGlobal.sharedObject finishDownload:self result:true];
-    Debug("ooid=%@, self.ooid=%@, oid=%@", ooid, self.ooid, self.oid);
+    Debug("%@ ooid=%@, self.ooid=%@, oid=%@", self.name, ooid, self.ooid, self.oid);
     BOOL updated = ![ooid isEqualToString:self.ooid];
     [self setOoid:ooid];
     self.state = SEAF_DENTRY_UPTODATE;
-    self.oid = self.ooid;
+    self.oid = ooid;
     [self savetoCache];
-    [self.delegate download:self complete:updated];
+    [self downloadComplete:updated];
 }
 
 - (void)failedDownload:(NSError *)error
 {
-    self.index = 0;
-    self.blkids = nil;
     [self clearDownloadContext];
-    [SeafGlobal.sharedObject finishDownload:self result:false];
     self.state = SEAF_DENTRY_INIT;
-    [self.delegate download:self failed:error];
+    [SeafGlobal.sharedObject finishDownload:self result:false];
+    [self downloadFailed:error];
 }
 
 - (void)finishDownloadThumb:(BOOL)success
@@ -159,10 +165,10 @@ typedef void (^SeafThumbCompleteBlock)(BOOL ret);
     _thumbtask = nil;
     if (success) {
         _icon = nil;
-        [self.delegate download:self complete:false];
+        [self downloadComplete:false];
     } else if (!_icon && self.image) {
         _icon = [Utils reSizeImage:self.image toSquare:THUMB_SIZE];
-        [self.delegate download:self complete:false];
+        [self downloadComplete:false];
     }
 }
 
@@ -175,7 +181,7 @@ typedef void (^SeafThumbCompleteBlock)(BOOL ret);
     [SeafGlobal.sharedObject incDownloadnum];
     [connection sendRequest:[NSString stringWithFormat:API_URL"/repos/%@/file/?p=%@", self.repoId, [self.path escapedUrl]] success:
      ^(NSURLRequest *request, NSHTTPURLResponse *response, id JSON) {
-         Debug("Download file from file server url: %@", JSON);
+         Debug("Download file from file server url: %@, state:%d %@", JSON, self.state, self.ooid);
          NSString *url = JSON;
          NSString *curId = [[response allHeaderFields] objectForKey:@"oid"];
          if (!curId)
@@ -185,31 +191,37 @@ typedef void (^SeafThumbCompleteBlock)(BOOL ret);
              [self finishDownload:curId];
              return;
          }
+
          @synchronized (self) {
+             if (self.state != SEAF_DENTRY_LOADING) {
+                 return Info("Download file %@ already canceled", self.name);
+             }
              if (self.downloadingFileOid) {// Already downloading
                  Debug("Already downloading %@", self.downloadingFileOid);
-                 [SeafGlobal.sharedObject finishDownload:self result:true];
-                 return;
+                 return [SeafGlobal.sharedObject decDownloadnum];
              }
              self.downloadingFileOid = curId;
          }
          [self.delegate download:self progress:0];
          url = [url stringByAddingPercentEscapesUsingEncoding:NSUTF8StringEncoding];
          NSURLRequest *downloadRequest = [NSURLRequest requestWithURL:[NSURL URLWithString:url]cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:DEFAULT_TIMEOUT];
-         Debug("Download file %@  %@ from %@", self.name, self.downloadingFileOid, url);
          NSProgress *progress = nil;
          NSString *target = [SeafGlobal.sharedObject documentPath:self.downloadingFileOid];
+         Debug("Download file %@  %@ from %@, target:%@ %d", self.name, self.downloadingFileOid, url, target, [Utils fileExistsAtPath:target]);
+
          _task = [connection.sessionMgr downloadTaskWithRequest:downloadRequest progress:&progress destination:^NSURL *(NSURL *targetPath, NSURLResponse *response) {
-             return [NSURL fileURLWithPath:target];
+             return [NSURL fileURLWithPath:[target stringByAppendingPathExtension:@"tmp"]];
          } completionHandler:^(NSURLResponse *response, NSURL *filePath, NSError *error) {
+             if (!self.downloadingFileOid) {
+                 return Info("Download file %@ already canceled", self.name);
+             }
              if (error) {
                  Debug("download %@, error=%@, %ld", self.name, [error localizedDescription], (long)((NSHTTPURLResponse *)response).statusCode);
                  [self failedDownload:error];
              } else {
-                 Debug("Successfully downloaded file:%@, %@ oid=%@, ooid=%@, delegate=%@", self.name, downloadRequest.URL, self.downloadingFileOid, self.ooid, self.delegate);
+                 Debug("Successfully downloaded file:%@, %@ oid=%@, ooid=%@, delegate=%@, %@", self.name, downloadRequest.URL, self.downloadingFileOid, self.ooid, self.delegate, filePath);
                  if (![filePath.path isEqualToString:target]) {
-                     Debug("target=%@, filePath=%@", target, filePath.path);
-                     [[NSFileManager defaultManager] removeItemAtPath:target error:nil];
+                     [Utils removeFile:target];
                      [[NSFileManager defaultManager] moveItemAtPath:filePath.path toPath:target error:nil];
                  }
                  [self finishDownload:self.downloadingFileOid];
@@ -225,7 +237,7 @@ typedef void (^SeafThumbCompleteBlock)(BOOL ret);
                     failure:
      ^(NSURLRequest *request, NSHTTPURLResponse *response, id JSON, NSError *error) {
          self.state = SEAF_DENTRY_INIT;
-         [self.delegate download:self failed:error];
+         [self downloadFailed:error];
      }];
 }
 
@@ -234,32 +246,37 @@ typedef void (^SeafThumbCompleteBlock)(BOOL ret);
     _thumbCompleteBlock = block;
 }
 
-- (void)downloadThumb
+- (void)downloadThumb:(id<SeafDownloadDelegate>)downloadTask
 {
     SeafRepo *repo = [connection getRepo:self.repoId];
     if (repo.encrypted) return;
     int size = THUMB_SIZE * (int)[[UIScreen mainScreen] scale];
     NSString *thumburl = [NSString stringWithFormat:API_URL"/repos/%@/thumbnail/?size=%d&p=%@", self.repoId, size, self.path.escapedUrl];
     NSURLRequest *downloadRequest = [connection buildRequest:thumburl method:@"GET" form:nil];
+    Debug("Request: %@", downloadRequest.URL);
     NSString *target = [self thumbPath:self.oid];
+
     @synchronized (self) {
         if (_thumbtask) return;
-        if (self.thumb) {
-            [self finishDownloadThumb:true];
-            return;
-        }
+        if (self.thumb) return [self finishDownloadThumb:true];
+
+        [SeafGlobal.sharedObject incDownloadnum];
         _thumbtask = [connection.sessionMgr downloadTaskWithRequest:downloadRequest progress:nil destination:^NSURL *(NSURL *targetPath, NSURLResponse *response) {
-            return [NSURL fileURLWithPath:target];
+            return [NSURL fileURLWithPath:[target stringByAppendingPathExtension:@"tmp"]];
         } completionHandler:^(NSURLResponse *response, NSURL *filePath, NSError *error) {
             if (error) {
                 Debug("Failed to download thumb %@, error=%@", self.name, error.localizedDescription);
             } else {
                 if (![filePath.path isEqualToString:target]) {
-                    [[NSFileManager defaultManager] removeItemAtPath:target error:nil];
+                    [Utils removeFile:target];
                     [[NSFileManager defaultManager] moveItemAtPath:filePath.path toPath:target error:nil];
                 }
             }
             [self finishDownloadThumb:!error];
+            if (downloadTask)
+                [SeafGlobal.sharedObject finishDownload:downloadTask result:(error == nil)];
+            else
+                [SeafGlobal.sharedObject decDownloadnum];
         }];
     }
     [_thumbtask resume];
@@ -306,13 +323,18 @@ typedef void (^SeafThumbCompleteBlock)(BOOL ret);
 
 - (void)finishBlock:(NSString *)blkid
 {
+    if (!self.downloadingFileOid) {
+        Debug("file download has beeen canceled.");
+        [self removeBlock:blkid];
+        return;
+    }
     self.index ++;
     if (self.index >= self.blkids.count) {
         if ([self checkoutFile] < 0) {
             Debug("Faile to checkout out file %@\n", self.downloadingFileOid);
             self.index = 0;
             for (NSString *blk_id in self.blkids)
-                [[NSFileManager defaultManager] removeItemAtPath:[SeafGlobal.sharedObject blockPath:blk_id] error:nil];
+                [self removeBlock:blk_id];
             NSError *error = [NSError errorWithDomain:@"Faile to checkout out file" code:-1 userInfo:nil];
             [self failedDownload:error];
             return;
@@ -325,6 +347,7 @@ typedef void (^SeafThumbCompleteBlock)(BOOL ret);
 
 - (void)donwloadBlock:(NSString *)blk_id fromUrl:(NSString *)url
 {
+    if (!self.isDownloading) return;
     NSURLRequest *downloadRequest = [NSURLRequest requestWithURL:[NSURL URLWithString:url]];
     Debug("URL: %@", downloadRequest.URL);
     NSProgress *progress = nil;
@@ -336,7 +359,7 @@ typedef void (^SeafThumbCompleteBlock)(BOOL ret);
             Warning("error=%@", error);
             [self failedDownload:error];
         } else {
-            Debug("Successfully downloaded file %@ block:%@", self.name, blk_id);
+            Debug("Successfully downloaded file %@ block:%@, filePath:%@", self.name, blk_id, filePath);
             if (![filePath.path isEqualToString:target]) {
                 [[NSFileManager defaultManager] removeItemAtPath:target error:nil];
                 [[NSFileManager defaultManager] moveItemAtPath:filePath.path toPath:target error:nil];
@@ -353,6 +376,7 @@ typedef void (^SeafThumbCompleteBlock)(BOOL ret);
 }
 - (void)downloadBlocks
 {
+    if (!self.isDownloading) return;
     NSString *blk_id = [self.blkids objectAtIndex:self.index];
     if ([[NSFileManager defaultManager] fileExistsAtPath:[SeafGlobal.sharedObject blockPath:blk_id]])
         return [self finishBlock:blk_id];
@@ -386,9 +410,11 @@ typedef void (^SeafThumbCompleteBlock)(BOOL ret);
              return;
          }
          @synchronized (self) {
+             if (self.state != SEAF_DENTRY_LOADING) {
+                 return Info("Download file %@ already canceled", self.name);
+             }
              if (self.downloadingFileOid) {// Already downloading
-                 [SeafGlobal.sharedObject finishDownload:self result:true];
-                 return;
+                 return [SeafGlobal.sharedObject decDownloadnum];
              }
              self.downloadingFileOid = curId;
          }
@@ -409,23 +435,24 @@ typedef void (^SeafThumbCompleteBlock)(BOOL ret);
                     failure:
      ^(NSURLRequest *request, NSHTTPURLResponse *response, id JSON, NSError *error) {
          self.state = SEAF_DENTRY_INIT;
-         [self.delegate download:self failed:error];
+         [self downloadFailed:error];
      }];
 }
 
-- (void)download
+- (void)downloadfile
 {
-    if (self.localDecrypt)
+    if ([connection localDecrypt:self.repoId] || _filesize > LARGE_FILE_SIZE) {
+        Debug("Download file %@ by blocks: %lld", self.name, _filesize);
         [self downloadByBlocks];
-    else
+    } else
         [self downloadByFile];
 }
 
 - (void)realLoadContent
 {
-    if (!self.isDownloading) {
+    if (!self.downloadingFileOid) {
         [self loadCache];
-        [self download];
+        [self downloadfile];
     } else {
         Debug("File %@ is already donwloading.", self.name);
     }
@@ -434,13 +461,19 @@ typedef void (^SeafThumbCompleteBlock)(BOOL ret);
 - (void)load:(id<SeafDentryDelegate>)delegate force:(BOOL)force
 {
     if (delegate != nil) self.delegate = delegate;
-    [self loadContent:NO];
+    [self loadContent:force];
+}
+
+- (void)download
+{
+    [self load:nil force:false];
 }
 
 - (BOOL)hasCache
 {
     if (self.mpath && [[NSFileManager defaultManager] fileExistsAtPath:self.mpath])
         return true;
+    //Debug(".... %@ %d", self.ooid, [[NSFileManager defaultManager] fileExistsAtPath:[SeafGlobal.sharedObject documentPath:self.ooid]]);
     if (self.ooid && [[NSFileManager defaultManager] fileExistsAtPath:[SeafGlobal.sharedObject documentPath:self.ooid]])
         return YES;
     self.ooid = nil;
@@ -462,8 +495,10 @@ typedef void (^SeafThumbCompleteBlock)(BOOL ret);
             UIImage *img = [self thumb];
             if (img)
                 return _thumb;
-            else
-                [self performSelectorInBackground:@selector(downloadThumb) withObject:nil];
+            else {
+                SeafThumb *thb = [[SeafThumb alloc] initWithSeafPreviewIem:self];
+                [SeafGlobal.sharedObject addDownloadTask:thb];
+            }
         } else if (self.image) {
             [self performSelectorInBackground:@selector(genThumb) withObject:nil];
         }
@@ -595,7 +630,6 @@ typedef void (^SeafThumbCompleteBlock)(BOOL ret);
         _exportURL = [NSURL fileURLWithPath:self.mpath];
         return _exportURL;
     }
-
     if (![self hasCache])
         return nil;
     @synchronized (self) {
@@ -821,8 +855,10 @@ typedef void (^SeafThumbCompleteBlock)(BOOL ret);
         self.ufile.delegate = self;
         self.ufile.overwrite = YES;
         NSString *path = [self.path stringByDeletingLastPathComponent];
-        self.ufile.udir = [[SeafDir alloc] initWithConnection:connection oid:nil repoId:self.repoId name:path.lastPathComponent path:path];
+        SeafDir *udir = [[SeafDir alloc] initWithConnection:connection oid:nil repoId:self.repoId perm:@"rw" name:path.lastPathComponent path:path];
+        [udir addUploadFile:self.ufile flush:true];
     }
+    Debug("Update file %@, to %@", self.ufile.lpath, self.ufile.udir.path);
     [SeafGlobal.sharedObject addUploadTask:self.ufile];
 }
 
@@ -831,46 +867,76 @@ typedef void (^SeafThumbCompleteBlock)(BOOL ret);
     _exportURL = nil;
     _preViewURL = nil;
     _shareLink = nil;
-    [[NSFileManager defaultManager] removeItemAtPath:[SeafGlobal.sharedObject documentPath:self.ooid] error:nil];
-    NSString *tempDir = [SeafGlobal.sharedObject.tempDir stringByAppendingPathComponent:self.ooid];
-    [[NSFileManager defaultManager] removeItemAtPath:tempDir error:nil];
+    if (self.ooid) {
+        [[NSFileManager defaultManager] removeItemAtPath:[SeafGlobal.sharedObject documentPath:self.ooid] error:nil];
+        NSString *tempDir = [SeafGlobal.sharedObject.tempDir stringByAppendingPathComponent:self.ooid];
+        [[NSFileManager defaultManager] removeItemAtPath:tempDir error:nil];
+    }
+    [Utils clearAllFiles:SeafGlobal.sharedObject.blocksDir];
     self.ooid = nil;
     self.state = SEAF_DENTRY_INIT;
 }
 
 - (void)cancelAnyLoading
 {
-    if (self.downloadingFileOid) {
+    Debug("Cancel download %@, %@, state:%d", self.path, self.downloadingFileOid, self.state);
+    if (self.state == SEAF_DENTRY_LOADING) {
         self.state = SEAF_DENTRY_INIT;
-        self.downloadingFileOid = nil;
         [self.task cancel];
-        _task = nil;
-        self.index = 0;
-        self.blkids = nil;
-        [SeafGlobal.sharedObject finishDownload:self result:true];
+        [self clearDownloadContext];
+        [SeafGlobal.sharedObject decDownloadnum];
+        [self downloadFailed:nil];
     }
 }
 
 #pragma mark - SeafUploadDelegate
-- (void)uploadProgress:(SeafFile *)file result:(BOOL)res progress:(int)percent
+- (void)uploadProgress:(SeafFile *)file progress:(int)percent
 {
-    id<SeafFileUpdateDelegate> dg = self.udelegate;
-    [dg updateProgress:self result:res completeness:percent];
+    [self.udelegate updateProgress:self progress:percent];
 }
 
-- (void)uploadSucess:(SeafUploadFile *)file oid:(NSString *)oid
+- (void)uploadComplete:(BOOL)success file:(SeafUploadFile *)file oid:(NSString *)oid
 {
+    if (!success) {
+        id<SeafFileUpdateDelegate> dg = self.udelegate;
+        return [dg updateComplete:self result:false];
+    }
     Debug("%@ file %@ upload success oid: %@, %@", self, self.name, oid, self.udelegate);
     id<SeafFileUpdateDelegate> dg = self.udelegate;
     self.ufile = nil;
     self.udelegate = nil;
     self.state = SEAF_DENTRY_INIT;
     self.ooid = oid;
-    self.oid = self.ooid;
+    self.oid = oid;
     _filesize = self.filesize;
     _mtime = self.mtime;
     [self setMpath:nil];
-    [dg updateProgress:self result:YES completeness:100];
+    [dg updateComplete:self result:true];
+}
+
+- (BOOL)waitUpload {
+    if (self.ufile)
+        return [self.ufile waitUpload];
+    return true;
+}
+
+- (void)setFileDownloadedBlock:(nullable SeafFileDidDownloadBlock)block
+{
+    self.fileDidDownload = block;
+}
+
+- (void)downloadComplete:(BOOL)updated
+{
+    [self.delegate download:self complete:true];
+    if (self.fileDidDownload)
+        self.fileDidDownload(self, true);
+
+}
+- (void)downloadFailed:(NSError *)error
+{
+    [self.delegate download:self failed:error];
+    if (self.fileDidDownload)
+        self.fileDidDownload(self, false);
 }
 
 @end

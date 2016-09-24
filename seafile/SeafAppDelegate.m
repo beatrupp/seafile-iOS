@@ -15,18 +15,17 @@
 #import "Utils.h"
 
 
-@interface SeafAppDelegate () <UITabBarControllerDelegate, UIAlertViewDelegate, PHPhotoLibraryChangeObserver, CLLocationManagerDelegate>
+@interface SeafAppDelegate () <UITabBarControllerDelegate, PHPhotoLibraryChangeObserver, CLLocationManagerDelegate>
 
 @property UIBackgroundTaskIdentifier bgTask;
 
 @property NSInteger moduleIdx;
+@property (readonly) UITabBarController *tabbarController;
 @property (readonly) SeafDetailViewController *detailVC;
 @property (readonly) UINavigationController *disDetailNav;
 @property (strong) NSArray *viewControllers;
 @property (readwrite) SeafGlobal *global;
 
-@property (strong) void (^handler_ok)();
-@property (strong) void (^handler_cancel)();
 @property (strong, nonatomic) dispatch_block_t expirationHandler;
 @property BOOL background;
 @property (strong) NSMutableArray *monitors;
@@ -50,11 +49,12 @@
     return SeafGlobal.sharedObject.uploadingnum != 0 || SeafGlobal.sharedObject.downloadingnum != 0;
 }
 
-- (void)selectAccount:(SeafConnection *)conn;
+- (BOOL)selectAccount:(SeafConnection *)conn
 {
     conn.delegate = self;
+    BOOL updated = ([[SeafGlobal sharedObject] connection] != conn);
     @synchronized(self) {
-        if ([[SeafGlobal sharedObject] connection] != conn) {
+        if (updated) {
             [[SeafGlobal sharedObject] setConnection: conn];
             [[self masterNavController:TABBED_SEAFILE] popToRootViewControllerAnimated:NO];
             [[self masterNavController:TABBED_STARRED] popToRootViewControllerAnimated:NO];
@@ -70,6 +70,37 @@
     if (self.deviceToken)
         [conn registerDevice:self.deviceToken];
 #endif
+    return updated;
+}
+
+- (void)enterAccount:(SeafConnection *)conn
+{
+    BOOL updated = [self selectAccount:conn];
+    if (self.window.rootViewController == self.tabbarController)
+        return;
+
+    Debug("isActivityEnabled:%d tabbarController: %ld", conn.isActivityEnabled, (long)self.tabbarController.viewControllers.count);
+    if (conn.isActivityEnabled) {
+        if (self.tabbarController.viewControllers.count != TABBED_COUNT) {
+            [self.tabbarController setViewControllers:self.viewControllers];
+        }
+    } else {
+        if (self.tabbarController.viewControllers.count == TABBED_COUNT) {
+            NSMutableArray *vcs = [NSMutableArray arrayWithArray:[self.tabbarController viewControllers]];
+            [vcs removeObjectAtIndex:TABBED_ACTIVITY];
+            [self.tabbarController setViewControllers:vcs];
+        }
+    }
+    if (updated)
+        [self.tabbarController setSelectedIndex:TABBED_SEAFILE];
+    self.window.rootViewController = self.tabbarController;
+    [self.window makeKeyAndVisible];
+}
+
+- (void)exitAccount
+{
+    self.window.rootViewController = _startNav;
+    [self.window makeKeyAndVisible];
 }
 
 - (BOOL)openSeafileURL:(NSURL*)url
@@ -85,7 +116,10 @@
 
     if (self.window.rootViewController == self.startNav) {
         [self.startVC selectDefaultAccount:^(bool success) {
-            if (!success) return;
+            if (!success) {
+                NSString *title = NSLocalizedString(@"Failed to open file", @"Seafile");
+                return [Utils alertWithTitle:title message:nil handler:nil from:self.startVC];
+            }
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.5*NSEC_PER_SEC), dispatch_get_main_queue(), ^(void){
                 [self openFile:repoId path:path];
             });
@@ -116,6 +150,9 @@
         [self.startVC selectDefaultAccount:^(bool success) {
             if (success) {
                 [self uploadFile:to.path];
+            } else {
+                NSString *title = NSLocalizedString(@"Failed to upload file", @"Seafile");
+                [Utils alertWithTitle:title message:nil handler:nil from:self.startVC];
             }
         }];
     } else
@@ -156,25 +193,35 @@
 {
     Debug("Start check photos changes.");
     for (SeafConnection *conn in SeafGlobal.sharedObject.conns) {
-        [conn checkPhotoChanges:notification];
+        [conn photosChanged:notification];
     }
 }
 
 - (void)delayedInit
 {
-    NSDictionary *infoDictionary = [[NSBundle mainBundle] infoDictionary];
-    NSString *version = [infoDictionary objectForKey:@"CFBundleShortVersionString"];
-    Debug("Current app version is %@\n%@\n", version, infoDictionary);
-    [SeafGlobal.sharedObject setObject:version forKey:@"VERSION"];
-    [SeafGlobal.sharedObject startTimer];
+    NSUserDefaults *defs = [[NSUserDefaults alloc] initWithSuiteName:GROUP_NAME];
+    NSMutableArray *array = [NSMutableArray new];
+    for(NSString *key in defs.dictionaryRepresentation) {
+        if ([key hasPrefix:@"EXPORTED/"]) {
+            [array addObject:key];
+        }
+    }
+    for(NSString *key in array) {
+        [defs removeObjectForKey:key];
+    }
+
+    Debug("clear tmp dir: %@", SeafGlobal.sharedObject.tempDir);
     [Utils clearAllFiles:SeafGlobal.sharedObject.tempDir];
+
+    Debug("Current app version is %@\n", SeafGlobal.sharedObject.clientVersion);
+    [SeafGlobal.sharedObject startTimer];
 
     for (SeafConnection *conn in SeafGlobal.sharedObject.conns) {
         [conn checkAutoSync];
     }
-    if (ios8)
+    if (ios8) {
          [[PHPhotoLibrary sharedPhotoLibrary] registerChangeObserver:self];
-    else
+    } else
         [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(checkPhotoChanges:) name:ALAssetsLibraryChangedNotification object:SeafGlobal.sharedObject.assetsLibrary];
     [self checkBackgroundUploadStatus];
     [SeafGlobal.sharedObject synchronize];
@@ -187,10 +234,7 @@
     [_global migrate];
     [self initTabController];
 
-    if (ios7)
-        [[UITabBar appearance] setTintColor:[UIColor colorWithRed:238.0f/256 green:136.0f/256 blue:51.0f/255 alpha:1.0]];
-    else
-        [[UITabBar appearance] setSelectedImageTintColor:[UIColor colorWithRed:238.0f/256 green:136.0f/256 blue:51.0f/255 alpha:1.0]];
+    [[UITabBar appearance] setTintColor:[UIColor colorWithRed:238.0f/256 green:136.0f/256 blue:51.0f/255 alpha:1.0]];
 
     [SeafGlobal.sharedObject loadAccounts];
 
@@ -198,22 +242,18 @@
     _startNav = (UINavigationController *)self.window.rootViewController;
     _startVC = (StartViewController *)_startNav.topViewController;
 
-    [Utils checkMakeDir:[[SeafGlobal.sharedObject applicationDocumentsDirectory] stringByAppendingPathComponent:OBJECTS_DIR]];
-    [Utils checkMakeDir:[[SeafGlobal.sharedObject applicationDocumentsDirectory] stringByAppendingPathComponent:AVATARS_DIR]];
-    [Utils checkMakeDir:[[SeafGlobal.sharedObject applicationDocumentsDirectory] stringByAppendingPathComponent:CERTS_DIR]];
-    [Utils checkMakeDir:[[SeafGlobal.sharedObject applicationDocumentsDirectory] stringByAppendingPathComponent:BLOCKS_DIR]];
-    [Utils checkMakeDir:[[SeafGlobal.sharedObject applicationDocumentsDirectory] stringByAppendingPathComponent:UPLOADS_DIR]];
-    [Utils checkMakeDir:[[SeafGlobal.sharedObject applicationDocumentsDirectory] stringByAppendingPathComponent:EDIT_DIR]];
-    [Utils checkMakeDir:[[SeafGlobal.sharedObject applicationDocumentsDirectory] stringByAppendingPathComponent:THUMB_DIR]];
-
+    [Utils checkMakeDir:SeafGlobal.sharedObject.objectsDir];
+    [Utils checkMakeDir:SeafGlobal.sharedObject.avatarsDir];
+    [Utils checkMakeDir:SeafGlobal.sharedObject.certsDir];
+    [Utils checkMakeDir:SeafGlobal.sharedObject.blocksDir];
+    [Utils checkMakeDir:SeafGlobal.sharedObject.uploadsDir];
+    [Utils checkMakeDir:SeafGlobal.sharedObject.editDir];
+    [Utils checkMakeDir:SeafGlobal.sharedObject.thumbsDir];
     [Utils checkMakeDir:SeafGlobal.sharedObject.tempDir];
 
 #if !(TARGET_IPHONE_SIMULATOR)
-    if (ios8) {
-        [[UIApplication sharedApplication] registerUserNotificationSettings:[UIUserNotificationSettings settingsForTypes:(UIUserNotificationTypeSound | UIUserNotificationTypeAlert | UIUserNotificationTypeBadge) categories:nil]];
-        [[UIApplication sharedApplication] registerForRemoteNotifications];
-    } else
-        [[UIApplication sharedApplication] registerForRemoteNotificationTypes:UIRemoteNotificationTypeBadge|UIRemoteNotificationTypeAlert|UIRemoteNotificationTypeSound];
+    [[UIApplication sharedApplication] registerUserNotificationSettings:[UIUserNotificationSettings settingsForTypes:(UIUserNotificationTypeSound | UIUserNotificationTypeAlert | UIUserNotificationTypeBadge) categories:nil]];
+    [[UIApplication sharedApplication] registerForRemoteNotifications];
 #endif
 
     NSDictionary *locationOptions = [launchOptions objectForKey:UIApplicationLaunchOptionsLocationKey];
@@ -225,7 +265,6 @@
         [self application:application didReceiveRemoteNotification:dict];
     } else
         [self.startVC selectDefaultAccount:^(bool success) {}];
-    [[AFNetworkReachabilityManager sharedManager] startMonitoring];
 
     self.bgTask = UIBackgroundTaskInvalid;
     __weak typeof(self) weakSelf = self;
@@ -250,14 +289,13 @@
 - (void)startBackgroundTask
 {
     // Start the long-running task.
-    Debug("start background task");
     UIApplication* app = [UIApplication sharedApplication];
     if (UIBackgroundTaskInvalid != self.bgTask) {
         [app endBackgroundTask:self.bgTask];
         self.bgTask = UIBackgroundTaskInvalid;
     }
     if (!self.shouldContinue) return;
-
+    Debug("start background task");
     self.bgTask = [app beginBackgroundTaskWithExpirationHandler:self.expirationHandler];
 }
 
@@ -275,7 +313,7 @@
 
 - (void)application:(UIApplication *)application didReceiveRemoteNotification:(NSDictionary *)userInfo
 {
-    NSString *status = [NSString stringWithFormat:@"Notification received:\n%@",[userInfo description]];
+    NSString *status __attribute__((unused)) = [NSString stringWithFormat:@"Notification received:\n%@",[userInfo description]];
     NSString *badgeStr = [[userInfo objectForKey:@"aps"] objectForKey:@"badge"];
     NSDictionary *alert = [[userInfo objectForKey:@"aps"] objectForKey:@"alert"];
     NSArray *args = [alert objectForKey:@"loc-args"];
@@ -336,8 +374,7 @@
 - (BOOL)tabBarController:(UITabBarController *)tabBarController shouldSelectViewController:(UIViewController *)viewController
 {
     if ([self.viewControllers indexOfObject:viewController] == TABBED_ACCOUNTS) {
-        self.window.rootViewController = _startNav;
-        [self.window makeKeyAndVisible];
+        [self exitAccount];
         return NO;
     }
     return YES;
@@ -435,21 +472,6 @@
     return (SeafActivityViewController *)[[self.viewControllers objectAtIndex:TABBED_ACTIVITY] topViewController];
 }
 
-- (BOOL)checkNetworkStatus
-{
-    NSLog(@"network status=%@\n", [[AFNetworkReachabilityManager sharedManager] localizedNetworkReachabilityStatusString]);
-    if (![[AFNetworkReachabilityManager sharedManager] isReachable]) {
-        UIAlertView *alert = [[UIAlertView alloc] initWithTitle:NSLocalizedString(@"Network unavailable", @"Seafile")
-                                                        message:nil
-                                                       delegate:nil
-                                              cancelButtonTitle:NSLocalizedString(@"OK", @"Seafile")
-                                              otherButtonTitles:nil];
-        [alert show];
-        return NO;
-    }
-    return YES;
-}
-
 - (void)showDetailView:(UIViewController *) c
 {
     UINavigationController *nc = [[UINavigationController alloc] initWithRootViewController:c];
@@ -483,61 +505,6 @@
     });
 }
 
-- (void)continueWithInvalidCert:(NSURLProtectionSpace *)protectionSpace yes:(void (^)())yes no:(void (^)())no
-{
-    NSString *title = [NSString stringWithFormat:NSLocalizedString(@"%@ can't verify the identity of the website \"%@\"", @"Seafile"), APP_NAME, protectionSpace.host];
-    NSString *message = NSLocalizedString(@"The certificate from this website is invalid. Would you like to connect to the server anyway?", @"Seafile");
-
-    UIViewController *c = self.window.rootViewController;
-    if (self.window.rootViewController.presentedViewController) {
-        c = self.window.rootViewController.presentedViewController;
-    }
-
-    if (ios8)
-        [Utils alertWithTitle:title message:message yes:yes no:no from:c];
-    else {
-        [SVProgressHUD dismiss];
-        dispatch_async(dispatch_get_main_queue(), ^{
-            self.handler_ok = yes;
-            self.handler_cancel = no;
-            UIAlertView *alert = [[UIAlertView alloc] initWithTitle:title message:message delegate:self cancelButtonTitle:STR_CANCEL otherButtonTitles:NSLocalizedString(@"OK", @"Seafile"), nil];
-            alert.alertViewStyle = UIAlertViewStyleDefault;
-            [alert show];
-        });
-    }
-}
-
-- (BOOL)continueWithInvalidCert:(NSURLProtectionSpace *)protectionSpace
-{
-    __block BOOL ret = false;
-    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
-    dispatch_block_t block = ^{
-        [self continueWithInvalidCert:protectionSpace yes:^{
-            ret = true;
-            dispatch_semaphore_signal(semaphore);
-        } no:^{
-            ret = false;
-            dispatch_semaphore_signal(semaphore);
-        }];
-    };
-    block();
-    dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
-
-    return ret;
-}
-#pragma mark - UIAlertViewDelegate
-- (void)alertView:(UIAlertView *)alertView willDismissWithButtonIndex:(NSInteger)buttonIndex
-{
-    if (buttonIndex != alertView.cancelButtonIndex) {
-        if (self.handler_ok) {
-            self.handler_ok();
-        }
-    } else {
-        if (self.handler_cancel)
-            self.handler_cancel();
-    }
-}
-
 #pragma mark - PHPhotoLibraryChangeObserver
 - (void)photoLibraryDidChange:(PHChange *)changeInstance
 {
@@ -553,19 +520,11 @@
     [_monitors addObject:monitor];
 }
 
-
-+ (void)showActionSheet:(UIActionSheet *)actionSheet fromBarButtonItem:(UIBarButtonItem *)item
-{
-    if (IsIpad())
-        [actionSheet showFromBarButtonItem:item animated:YES];
-    else
-        [actionSheet showInView:[UIApplication sharedApplication].keyWindow];
-}
-
 #pragma mark - CLLocationManagerDelegate
 - (void)locationManager:(CLLocationManager *)manager didUpdateLocations:(NSArray *)locations
 {
     Debug("Location updated: %@", locations);
+    [self checkPhotoChanges:nil];
 }
 
 - (void)startSignificantChangeUpdates

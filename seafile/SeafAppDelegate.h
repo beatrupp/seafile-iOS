@@ -25,6 +25,7 @@ enum {
     TABBED_ACTIVITY,
     TABBED_SETTINGS,
     TABBED_ACCOUNTS,
+    TABBED_COUNT,
 };
 
 @protocol SeafBackgroundMonitor <NSObject>
@@ -48,16 +49,12 @@ enum {
 #define STR_12 NSLocalizedString(@"A file with the same name already exists, do you want to overwrite?", @"Seafile")
 #define STR_13 NSLocalizedString(@"Files with the same name already exist, do you want to overwrite?", @"Seafile")
 #define STR_15 NSLocalizedString(@"Your device cannot authenticate using Touch ID.", @"Seafile")
-#define STR_16 NSLocalizedString(@"There was a problem verifying your identity.", @"Seafile")
-#define STR_17 NSLocalizedString(@"Please authenticate to proceed", @"Seafile")
-#define STR_18 NSLocalizedString(@"Failed to authenticate", @"Seafile")
 
 
 @interface SeafAppDelegate : UIResponder <UIApplicationDelegate, SeafConnectionDelegate>
 @property (strong, nonatomic) UIWindow *window;
 
 @property (readonly) UINavigationController *startNav;
-@property (readonly) UITabBarController *tabbarController;
 
 @property (strong, readonly) StartViewController *startVC;
 @property (readonly) SeafFileViewController *fileVC;
@@ -67,25 +64,20 @@ enum {
 @property (readonly) MFMailComposeViewController *globalMailComposer;
 @property (readonly) NSData *deviceToken;
 
+- (void)enterAccount:(SeafConnection *)conn;
+- (void)exitAccount;
 
-- (void)selectAccount:(SeafConnection *)conn;
-
-- (UINavigationController *)masterNavController:(int)index;
 - (UIViewController *)detailViewControllerAtIndex:(int)index;
 
 - (void)showDetailView:(UIViewController *) c;
 - (void)cycleTheGlobalMailComposer;
 
-- (BOOL)checkNetworkStatus;
-
 - (void)addBackgroundMonitor:(id<SeafBackgroundMonitor>)monitor;
-- (void)continueWithInvalidCert:(NSURLProtectionSpace *)protectionSpace yes:(void (^)())yes no:(void (^)())no;
 
 - (void)startSignificantChangeUpdates;
 - (void)stopSignificantChangeUpdates;
 - (void)checkBackgroundUploadStatus;
 
-+ (void)showActionSheet:(UIActionSheet *)sheet fromBarButtonItem:(UIBarButtonItem *)item;
 + (void)checkOpenLink:(SeafFileViewController *)c;
 
 @end

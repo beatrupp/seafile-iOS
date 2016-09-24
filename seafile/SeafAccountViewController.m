@@ -12,7 +12,11 @@
 #import "UIViewController+Extend.h"
 #import "SVProgressHUD.h"
 #import "SeafRepos.h"
+#import "SecurityUtilities.h"
+#import "UIViewController+Extend.h"
 #import "Debug.h"
+#import <openssl/x509.h>
+
 
 #define HTTP @"http://"
 #define HTTPS @"https://"
@@ -201,14 +205,11 @@
         case ACCOUNT_SEACLOUD:
             serverTextField.text = SERVER_SEACLOUD;
             break;
-        case ACCOUNT_CLOUD:
-            serverTextField.text = SERVER_CLOUD;
-            break;
         case ACCOUNT_OTHER:{
 #if DEBUG
-            serverTextField.text = @"https://dev.seafile.com/seahub/";
+            serverTextField.text = @"https://dev.seafile.com/seahub";
             usernameTextField.text = @"demo@seafile.com";
-            passwordTextField.text = @"demo";
+            passwordTextField.text = @"";
 #else
             serverTextField.text = HTTPS;
 #endif
@@ -255,31 +256,120 @@
 }
 
 #pragma mark - SeafLoginDelegate
+- (id)getClientCertPersistentRef:(NSURLCredential *__autoreleasing *)credential
+{
+    __block NSURLCredential *b_cred = NULL;
+    __block id b_key;
+    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+    BOOL ret = [self getClientCert:^(id key, NSURLCredential *cred) {
+        b_cred = cred;
+        b_key = key;
+        dispatch_semaphore_signal(semaphore);
+
+    }];
+    if (!ret) return nil;
+
+    dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
+    Debug("Choosed credential: %@", b_cred);
+    *credential = b_cred;
+    return b_key;
+}
+
+- (BOOL)getClientCert:(void (^)(id key, NSURLCredential *cred))completeHandler
+{
+    NSDictionary *dict = [SeafGlobal.sharedObject getAllSecIdentities];
+    if (dict.count == 0) {
+        Warning("No client certificates.");
+        [SVProgressHUD showErrorWithStatus:NSLocalizedString(@"No available certificates", @"Seafile")];
+        return false;
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [SeafGlobal.sharedObject chooseCertFrom:dict handler:^(CFDataRef persistentRef, SecIdentityRef identity) {
+            if (!identity || ! persistentRef) completeHandler(nil, nil);
+            completeHandler((__bridge id)persistentRef, [SecurityUtilities getCredentialFromSecIdentity:identity]);
+        } from:self];
+    });
+    return true;
+}
+
+- (void)authorizeInvalidCert:(NSURLProtectionSpace *)protectionSpace yes:(void (^)())yes no:(void (^)())no
+{
+    NSString *title = [NSString stringWithFormat:NSLocalizedString(@"%@ can't verify the identity of the website \"%@\"", @"Seafile"), APP_NAME, protectionSpace.host];
+    NSString *message = NSLocalizedString(@"The certificate from this website is invalid. Would you like to connect to the server anyway?", @"Seafile");
+    [self alertWithTitle:title message:message yes:yes no:no];
+}
+
+- (BOOL)authorizeInvalidCert:(NSURLProtectionSpace *)protectionSpace
+{
+    __block BOOL ret = false;
+    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+    dispatch_block_t block = ^{
+        [self authorizeInvalidCert:protectionSpace yes:^{
+            ret = true;
+            dispatch_semaphore_signal(semaphore);
+        } no:^{
+            ret = false;
+            dispatch_semaphore_signal(semaphore);
+        }];
+    };
+    block();
+    dispatch_semaphore_wait(semaphore, DISPATCH_TIME_FOREVER);
+    return ret;
+}
+
 - (void)loginSuccess:(SeafConnection *)conn
 {
     if (conn != connection)
         return;
 
     Debug("login success");
-    [SVProgressHUD dismiss];
-    connection.loginDelegate = nil;
-    [self.navigationController dismissViewControllerAnimated:YES completion:nil];
-    [startController saveAccount:connection];
-    [startController checkSelectAccount:connection];
+    [conn getServerInfo:^(bool result) {
+        Debug("Get server info result: %d", result);
+        [SVProgressHUD dismiss];
+        connection.loginDelegate = nil;
+        [self.navigationController dismissViewControllerAnimated:YES completion:nil];
+        [startController saveAccount:connection];
+        [startController checkSelectAccount:connection];
+    }];
 }
 
-- (void)loginFailed:(SeafConnection *)conn error:(NSError *)error code:(NSInteger)errorCode
+- (void)twoStepVerification
 {
-    Debug("%@, error=%ld\n", conn.address, (long)error);
+    NSString *placeHolder = NSLocalizedString(@"Two step verification code", @"Seafile");;
+    [self popupInputView:placeHolder placeholder:placeHolder secure:false handler:^(NSString *input) {
+        if (!input || input.length == 0) {
+            [self alertWithTitle:NSLocalizedString(@"Verification code must not be empty", @"Seafile")];
+            return;
+        }
+        NSString *username = usernameTextField.text;
+        NSString *password = passwordTextField.text;
+        [connection loginWithUsername:username password:password otp:input];
+        [SVProgressHUD showWithStatus:NSLocalizedString(@"Connecting to server", @"Seafile")];
+    }];
+}
+
+- (void)loginFailed:(SeafConnection *)conn response:(NSURLResponse *)response error:(NSError *)error
+{
+    Debug("Failed to login: %@\n", conn.address);
     if (conn != connection)
         return;
 
+    [SVProgressHUD dismiss];
+    if (error.code == kCFURLErrorCancelled) {
+        return;
+    }
+
+    NSHTTPURLResponse *resp = (NSHTTPURLResponse *)response;
+    long errorCode = resp.statusCode;
     if (errorCode == HTTP_ERR_LOGIN_INCORRECT_PASSWORD) {
-        [SVProgressHUD dismiss];
-        [self alertWithTitle:NSLocalizedString(@"Wrong username or password", @"Seafile")];
+        NSString * otp = [resp.allHeaderFields objectForKey:@"X-Seafile-OTP"];
+        if ([@"required" isEqualToString:otp]) {
+            [self twoStepVerification];
+        } else
+            [self alertWithTitle:NSLocalizedString(@"Wrong username or password", @"Seafile")];
     } else {
         NSString *msg = NSLocalizedString(@"Failed to login", @"Seafile");
-        [SVProgressHUD showErrorWithStatus:[msg stringByAppendingFormat:@": %ld %@", (long)errorCode, error.localizedDescription]];
+        [SVProgressHUD showErrorWithStatus:[msg stringByAppendingFormat:@": %@", error.localizedDescription]];
     }
 }
 

@@ -9,7 +9,7 @@
 @import LocalAuthentication;
 @import QuartzCore;
 
-#import <SVProgressHUD.h>
+#import "SVProgressHUD.h"
 
 #import "SeafAppDelegate.h"
 #import "SeafDetailViewController.h"
@@ -30,12 +30,17 @@ enum {
 };
 
 enum {
+    CELL_CACHE_SIZE = 0,
+    CELL_CACHE_WIPE,
+};
+
+enum {
     SECTION_ACCOUNT = 0,
     SECTION_CAMERA,
     SECTION_CACHE,
     SECTION_ENC,
     SECTION_ABOUT,
-    SECTION_WIPECACHE,
+    SECTION_LOGOUT,
 };
 enum CAMERA_CELL{
     CELL_AUTO = 0,
@@ -52,6 +57,7 @@ enum ENC_LIBRARIES{
 #define SEAFILE_SITE @"http://www.seafile.com"
 #define MSG_RESET_UPLOADED NSLocalizedString(@"Do you want reset the uploaded photos?", @"Seafile")
 #define MSG_CLEAR_CACHE NSLocalizedString(@"Are you sure to clear all the cache?", @"Seafile")
+#define MSG_LOG_OUT NSLocalizedString(@"Are you sure to log out?", @"Seafile")
 
 @interface SeafSettingsViewController ()<SeafDirDelegate, SeafPhotoSyncWatcherDelegate, MFMailComposeViewControllerDelegate, CLLocationManagerDelegate>
 @property (strong, nonatomic) IBOutlet UITableViewCell *nameCell;
@@ -66,8 +72,9 @@ enum ENC_LIBRARIES{
 @property (strong, nonatomic) IBOutlet UITableViewCell *videoSyncCell;
 @property (strong, nonatomic) IBOutlet UITableViewCell *backgroundSyncCell;
 @property (strong, nonatomic) IBOutlet UITableViewCell *clearEncRepoPasswordCell;
+@property (strong, nonatomic) IBOutlet UITableViewCell *wipeCacheCell;
 
-@property (strong, nonatomic) IBOutlet UILabel *wipeCacheLabel;
+@property (strong, nonatomic) IBOutlet UILabel *logOutLabel;
 @property (strong, nonatomic) IBOutlet UILabel *autoCameraUploadLabel;
 @property (strong, nonatomic) IBOutlet UILabel *wifiOnlyLabel;
 @property (strong, nonatomic) IBOutlet UILabel *videoSyncLabel;
@@ -193,7 +200,7 @@ enum ENC_LIBRARIES{
 - (void)videoSyncSwitchFlip:(id)sender
 {
     self.videoSync = _videoSyncSwitch.on;
-    [_connection checkPhotoChanges:nil];
+    [_connection photosChanged:nil];
 }
 
 - (CLLocationManager *)locationManager {
@@ -247,7 +254,7 @@ enum ENC_LIBRARIES{
         }
         return;
     }
-    if (status != kCLAuthorizationStatusAuthorizedAlways && status != kCLAuthorizationStatusAuthorized) {
+    if (status != kCLAuthorizationStatusAuthorizedAlways) {
         [self alertWithTitle:NSLocalizedString(@"This app does not have access to your location service.", @"Seafile") message:NSLocalizedString(@"You can enable access in Privacy Settings", @"Seafile")];
         _backgroundSyncSwitch.on = false;
     } else {
@@ -270,12 +277,14 @@ enum ENC_LIBRARIES{
 
     _syncRepoCell.textLabel.text = NSLocalizedString(@"Upload Destination", @"Seafile");
     _cacheCell.textLabel.text = NSLocalizedString(@"Local Cache", @"Seafile");
+    _wipeCacheCell.textLabel.text = NSLocalizedString(@"Wipe Cache", @"Seafile");
+
     _tellFriendCell.textLabel.text = [NSString stringWithFormat:NSLocalizedString(@"Tell Friends about %@", @"Seafile"), APP_NAME];
     _websiteCell.textLabel.text = NSLocalizedString(@"Website", @"Seafile");
     _websiteCell.detailTextLabel.text = @"www.seafile.com";
     _serverCell.textLabel.text = NSLocalizedString(@"Server", @"Seafile");
     _versionCell.textLabel.text = NSLocalizedString(@"Version", @"Seafile");
-    _wipeCacheLabel.text = NSLocalizedString(@"Wipe Cache", @"Seafile");
+    _logOutLabel.text = NSLocalizedString(@"Log out", @"Seafile");
     _clearEncRepoPasswordCell.textLabel.text = NSLocalizedString(@"Clear remembered passwords", @"Seafile");
     self.title = NSLocalizedString(@"Settings", @"Seafile");
 
@@ -351,18 +360,22 @@ enum ENC_LIBRARIES{
     [self.tableView reloadData];
 }
 
-- (void)setConnection:(SeafConnection *)connection
+- (void)updateAccountInfo
 {
-    _connection = connection;
-    [self.tableView reloadData];
-    [_connection getAccountInfo:^(bool result, SeafConnection *conn) {
-        if (result && conn == self.connection) {
+    [_connection getAccountInfo:^(bool result) {
+        if (result) {
             dispatch_async(dispatch_get_main_queue(), ^ {
                 [self configureView];
                 _connection.photSyncWatcher = self;
             });
         }
     }];
+}
+- (void)setConnection:(SeafConnection *)connection
+{
+    _connection = connection;
+    [self.tableView reloadData];
+    [self updateAccountInfo];
 }
 
 - (void)popupRepoSelect
@@ -377,17 +390,27 @@ enum ENC_LIBRARIES{
     [self.tableView deselectRowAtIndexPath:[self.tableView indexPathForSelectedRow] animated:NO];
     if (indexPath.section == SECTION_ACCOUNT) {
         if (indexPath.row == 1) // Select the quota cell
-            [_connection getAccountInfo:^(bool result, SeafConnection *conn) {
-                if (result && conn == self.connection) {
-                    dispatch_async(dispatch_get_main_queue(), ^ {
-                        [self configureView];
-                    });
-                }
-            }];
+            [self updateAccountInfo];
     } else if (indexPath.section == SECTION_CAMERA) {
         Debug("selected %ld, autoSync: %d", (long)indexPath.row, self.autoSync);
-        if (indexPath.row == CELL_DESTINATION && self.autoSync) {
-            [self popupRepoSelect];
+        if (indexPath.row == CELL_DESTINATION) {
+            if (self.autoSync) {
+                [self popupRepoSelect];
+            } else {
+                [self alertWithTitle:NSLocalizedString(@"Auto upload should be enabled first.", @"Seafile")];
+            }
+        }
+    } else if (indexPath.section == SECTION_CACHE) {
+        Debug("selected %ld, autoSync: %d", (long)indexPath.row, self.autoSync);
+        if (indexPath.row == CELL_CACHE_SIZE) {
+        } else if (indexPath.row == CELL_CACHE_WIPE) {
+            [self alertWithTitle:MSG_CLEAR_CACHE message:nil yes:^{
+                SeafAppDelegate *appdelegate = (SeafAppDelegate *)[[UIApplication sharedApplication] delegate];
+                [(SeafDetailViewController *)[appdelegate detailViewControllerAtIndex:TABBED_SETTINGS] setPreViewItem:nil master:nil];
+                [SeafGlobal.sharedObject clearCache];
+                long long cacheSize = [self cacheSize];
+                _cacheCell.detailTextLabel.text = [FileSizeFormatter stringFromLongLong:cacheSize];
+            } no:nil];
         }
     } else if (indexPath.section == SECTION_ENC) {
         if (indexPath.row == CELL_CLEAR_PASSWORD) {
@@ -412,26 +435,19 @@ enum ENC_LIBRARIES{
             default:
                 break;
         }
-    } else if (indexPath.section == SECTION_WIPECACHE) {
-        [self alertWithTitle:MSG_CLEAR_CACHE message:nil yes:^{
-            SeafAppDelegate *appdelegate = (SeafAppDelegate *)[[UIApplication sharedApplication] delegate];
-            [(SeafDetailViewController *)[appdelegate detailViewControllerAtIndex:TABBED_SETTINGS] setPreViewItem:nil master:nil];
-            [Utils clearAllFiles:SeafGlobal.sharedObject.objectsDir];
-            [Utils clearAllFiles:SeafGlobal.sharedObject.blocksDir];
-            [Utils clearAllFiles:SeafGlobal.sharedObject.editDir];
-            [Utils clearAllFiles:SeafGlobal.sharedObject.thumbsDir];
-            [Utils clearAllFiles:SeafGlobal.sharedObject.tempDir];
-            [SeafUploadFile clearCache];
-            [SeafAvatar clearCache];
-
-            [[SeafGlobal sharedObject] deleteAllObjects:@"Directory"];
-            [[SeafGlobal sharedObject] deleteAllObjects:@"DownloadedFile"];
-            [[SeafGlobal sharedObject] deleteAllObjects:@"SeafCacheObj"];
-
-            long long cacheSize = [self cacheSize];
-            _cacheCell.detailTextLabel.text = [FileSizeFormatter stringFromLongLong:cacheSize];
-        } no:nil];
+    } else if (indexPath.section == SECTION_LOGOUT) {
+        [self logOut];
     }
+}
+
+- (void)logOut
+{
+    [self alertWithTitle:MSG_LOG_OUT message:nil yes:^{
+        Debug("Log out %@ %@", _connection.address, _connection.username);
+        [_connection logout];
+        SeafAppDelegate *appdelegate = (SeafAppDelegate *)[[UIApplication sharedApplication] delegate];
+        [appdelegate exitAccount];
+    } no:nil];
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section
@@ -444,7 +460,7 @@ enum ENC_LIBRARIES{
         NSLocalizedString(@"About", @"Seafile"),
         @"",
     };
-    if (section < SECTION_ACCOUNT || section > SECTION_WIPECACHE)
+    if (section < SECTION_ACCOUNT || section > SECTION_LOGOUT)
         return nil;
     if (section == SECTION_CAMERA && _connection.inAutoSync) {
         NSUInteger num = _connection.photosInSyncing;
@@ -457,7 +473,7 @@ enum ENC_LIBRARIES{
             remainStr = [NSString stringWithFormat:NSLocalizedString(@"%ld photos remain", @"Seafile"), num];
         }
 #if DEBUG
-        remainStr = [remainStr stringByAppendingFormat:@"  U:%ld D:%ld", (long)SeafGlobal.sharedObject.uploadingnum, (long)SeafGlobal.sharedObject.downloadingnum];
+        remainStr = [remainStr stringByAppendingFormat:@"  U:%lu D:%lu", SeafGlobal.sharedObject.uploadingnum, SeafGlobal.sharedObject.downloadingnum];
 #endif
         return [sectionNames[section] stringByAppendingFormat:@"\t %@", remainStr];
     }
@@ -509,7 +525,7 @@ enum ENC_LIBRARIES{
     MFMailComposeViewController *mailPicker = appdelegate.globalMailComposer;
     mailPicker.mailComposeDelegate = self;
     [self configureInvitationMail:mailPicker];
-    [appdelegate.tabbarController presentViewController:mailPicker animated:YES completion:nil];
+    [appdelegate.window.rootViewController presentViewController:mailPicker animated:YES completion:nil];
 }
 
 #pragma mark - MFMailComposeViewControllerDelegate
@@ -551,18 +567,16 @@ enum ENC_LIBRARIES{
     [appdelegate checkBackgroundUploadStatus];
 }
 
-- (void)chooseDir:(UIViewController *)c dir:(SeafDir *)dir
+- (void)setAutoSyncRepo:(SeafRepo *)repo
 {
-    if (c.navigationController == self.navigationController) {
-        [self.navigationController popToRootViewControllerAnimated:true];
-    } else {
-        [c.navigationController dismissViewControllerAnimated:YES completion:nil];
-    }
     NSString *old = _connection.autoSyncRepo;
-    SeafRepo *repo = (SeafRepo *)dir;
     if ([repo.repoId isEqualToString:old]) {
-        [_connection checkPhotoChanges:nil];
+        [_connection photosChanged:nil];
         return;
+    }
+
+    if (_connection.autoSyncedNum == 0) {
+        return [self setSyncRepo:repo];
     }
 
     dispatch_async(dispatch_get_main_queue(), ^ {
@@ -573,6 +587,28 @@ enum ENC_LIBRARIES{
             [self setSyncRepo:repo];
         }];
     });
+}
+- (void)chooseDir:(UIViewController *)c dir:(SeafDir *)dir
+{
+    if (c.navigationController == self.navigationController) {
+        [self.navigationController popToRootViewControllerAnimated:true];
+    } else {
+        [c.navigationController dismissViewControllerAnimated:YES completion:nil];
+    }
+    SeafRepo *repo = (SeafRepo *)dir;
+    Debug("Choose repo %@ for photo auto upload, encryped:%d", repo.name, repo.encrypted);
+    if (repo.encrypted) {
+        if (!_connection.localDecryption) {
+            return [self alertWithTitle:NSLocalizedString(@"Please enable \"Local decryption\" for auto uploading photos to an encrypted library.", @"Seafile")];
+        } else if (_connection.autoClearRepoPasswd) {
+            return [self alertWithTitle:NSLocalizedString(@"Please disable \"Auto clear passwords\" for auto uploading photos to an encrypted library.", @"Seafile")];
+        } else if (repo.passwordRequired) {
+            return [self popupSetRepoPassword:repo handler:^{
+                [self setAutoSyncRepo:repo];
+            }];
+        }
+    }
+    [self setAutoSyncRepo:repo];
 }
 
 - (void)cancelChoose:(UIViewController *)c
@@ -588,8 +624,11 @@ enum ENC_LIBRARIES{
 - (void)photoSyncChanged:(long)remain
 {
     Debug("%ld photos remain to uplaod", remain);
-    if (self.isVisible)
-        [self.tableView reloadData];
+    if (self.isVisible) {
+        dispatch_async(dispatch_get_main_queue(), ^ {
+            [self.tableView reloadData];
+        });
+    }
 }
 
 #pragma mark - CLLocationManagerDelegate
@@ -597,7 +636,7 @@ enum ENC_LIBRARIES{
 - (void)locationManager:(CLLocationManager *)manager didChangeAuthorizationStatus:(CLAuthorizationStatus)status
 {
     Debug("AuthorizationStatus: %d", status);
-    if (status != kCLAuthorizationStatusAuthorizedAlways && status != kCLAuthorizationStatusAuthorized) {
+    if (status != kCLAuthorizationStatusAuthorizedAlways) {
         _backgroundSyncSwitch.on = false;
     } else {
         _backgroundSyncSwitch.on = true;

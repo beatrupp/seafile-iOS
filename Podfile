@@ -6,7 +6,10 @@ def shared
 end
 
 target :"seafile-appstore" do
-  pod 'EGOTableViewPullRefresh', '~> 0.1.0'
+  platform :ios, '8.0'
+  use_frameworks!
+
+  pod 'SVPullToRefresh', '~> 0.4.1'
   pod 'SVProgressHUD', '~> 1.1.3'
   pod 'SWTableViewCell', :git => 'https://github.com/haiwen/SWTableViewCell.git', :branch => 'master'
   pod 'MWPhotoBrowser', :git => 'https://github.com/haiwen/MWPhotoBrowser.git', :branch => 'master'

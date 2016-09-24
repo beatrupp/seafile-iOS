@@ -8,9 +8,11 @@
 
 #import "DocumentPickerViewController.h"
 #import "SeafProviderFileViewController.h"
+#import "UIViewController+Extend.h"
 #import "SeafConnection.h"
 #import "SeafAccountCell.h"
 #import "SeafGlobal.h"
+#import "Utils.h"
 #import "Debug.h"
 
 
@@ -27,6 +29,7 @@
     _conns = SeafGlobal.sharedObject.conns;
     self.tableView.separatorStyle = UITableViewCellSeparatorStyleNone;
     [self.tableView reloadData];
+    Debug("mode: %lu", (unsigned long)mode);
 }
 
 #pragma mark - Table view data source
@@ -71,7 +74,17 @@
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath
 {
     SeafConnection *conn = [SeafGlobal.sharedObject.conns objectAtIndex:indexPath.row];
-    [self pushViewControllerDir:(SeafDir *)conn.rootFolder];
+    Debug("TouchId for account %@ %@, %d", conn.address, conn.username, conn.touchIdEnabled);
+    if (!conn.touchIdEnabled) {
+        return [self pushViewControllerDir:(SeafDir *)conn.rootFolder];
+    }
+    [self checkTouchId:^(bool success) {
+        if (success) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.), dispatch_get_main_queue(), ^{
+                [self pushViewControllerDir:(SeafDir *)conn.rootFolder];
+            });
+        }
+    }];
 }
 
 - (void)pushViewControllerDir:(SeafDir *)dir
@@ -79,7 +92,7 @@
     SeafProviderFileViewController *controller = [[UIStoryboard storyboardWithName:@"SeafProviderFileViewController" bundle:nil] instantiateViewControllerWithIdentifier:@"SeafProviderFileViewController"];
     controller.directory = dir;
     controller.root = self;
-    controller.view.frame = CGRectMake(self.view.frame.size.width, self.view.frame.origin.y, self.view.frame.size.width, self.view.frame.size.height);
+    controller.view.frame = CGRectMake(self.view.frame.size.width, self.view.frame.origin.y, self.view.frame.size.width, self.view.frame.size.height-44);
     @synchronized (self) {
         if (self.childViewControllers.count > 0)
             return;
@@ -88,7 +101,7 @@
     [controller didMoveToParentViewController:self];
     [self.view addSubview:controller.view];
     [UIView animateWithDuration:0.5f delay:0.f options:0 animations:^{
-        controller.view.frame = self.view.frame;
+        controller.view.frame = CGRectMake(self.view.frame.origin.x, self.view.frame.origin.y, self.view.frame.size.width, self.view.frame.size.height-44);
     } completion:^(BOOL finished) {
     }];
 }

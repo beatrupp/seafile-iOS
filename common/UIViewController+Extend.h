@@ -7,11 +7,9 @@
 //
 
 #import <UIKit/UIKit.h>
+#import "SeafRepos.h"
 
-@interface UIViewController (Extend)<UIAlertViewDelegate>
-@property void (^handler_ok)();
-@property void (^handler_cancel)();
-@property void (^handler_input)(NSString *input);
+@interface UIViewController (Extend)
 
 - (id)initWithAutoNibName;
 - (id)initWithAutoPlatformNibName;
@@ -30,5 +28,11 @@
 - (UIBarButtonItem *)getSpaceBarItem:(float)width;
 
 - (BOOL)isVisible;
+
+- (void)popupSetRepoPassword:(SeafRepo *)repo handler:(void (^)())handler;
+- (void)checkTouchId:(void (^)(bool success))handler;
+- (UIAlertController *)generateAlert:(NSArray *)arr withTitle:(NSString *)title handler:(void (^)(UIAlertAction *action))handler;
+
+- (BOOL)checkNetworkStatus;
 
 @end

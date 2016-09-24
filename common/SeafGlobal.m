@@ -5,11 +5,15 @@
 //  Created by Wang Wei on 11/9/14.
 //  Copyright (c) 2014 Seafile. All rights reserved.
 //
+@import LocalAuthentication;
+
 #import "SeafGlobal.h"
 #import "SeafUploadFile.h"
+#import "SeafAvatar.h"
 #import "SeafDir.h"
 #import "Utils.h"
 #import "Debug.h"
+#import "SecurityUtilities.h"
 
 /*
 static NSError * NewNSErrorFromException(NSException * exc) {
@@ -35,6 +39,8 @@ static NSError * NewNSErrorFromException(NSException * exc) {
 @property NSTimer *autoSyncTimer;
 @property (readonly) NSURL *applicationDocumentsDirectoryURL;
 
+@property NSMutableDictionary *secIdentities;
+
 @end
 
 @implementation SeafGlobal
@@ -54,7 +60,14 @@ static NSError * NewNSErrorFromException(NSException * exc) {
         _downloadnum = 0;
         _storage = [[NSUserDefaults alloc] initWithSuiteName:GROUP_NAME];
         [self checkSettings];
-        Debug("applicationDocumentsDirectoryURL=%@",  self.applicationDocumentsDirectoryURL);
+
+        NSDictionary *infoDictionary = [[NSBundle mainBundle] infoDictionary];
+        _clientVersion = [infoDictionary objectForKey:@"CFBundleShortVersionString"];
+        _platformVersion = [infoDictionary objectForKey:@"DTPlatformVersion"];
+        [_storage setObject:_clientVersion forKey:@"VERSION"];
+        [[AFNetworkReachabilityManager sharedManager] startMonitoring];
+        [self loadSecIdentities];
+        Debug("applicationDocumentsDirectoryURL=%@, clientVersion=%@, platformVersion=%@",  self.applicationDocumentsDirectoryURL, _clientVersion, _platformVersion);
     }
     return self;
 }
@@ -133,10 +146,14 @@ static NSError * NewNSErrorFromException(NSException * exc) {
 {
     return [[self applicationDocumentsDirectory] stringByAppendingPathComponent:TEMP_DIR];
 }
+- (NSString *)documentStorageDir
+{
+    return [[[[NSFileManager defaultManager] containerURLForSecurityApplicationGroupIdentifier:GROUP_NAME] path] stringByAppendingPathComponent:@"File Provider Storage"];
+}
 
 - (NSString *)documentPath:(NSString*)fileId
 {
-    return[self.objectsDir stringByAppendingPathComponent:fileId];
+    return [self.objectsDir stringByAppendingPathComponent:fileId];
 }
 
 - (NSString *)blockPath:(NSString*)blkId
@@ -193,9 +210,8 @@ static NSError * NewNSErrorFromException(NSException * exc) {
         [newDef synchronize];
         [oldDef removeObjectForKey:@"ACCOUNTS"];
         [oldDef synchronize];
+        Debug("accounts:%@\nnew:%@", oldDef.dictionaryRepresentation, newDef.dictionaryRepresentation);
     }
-    Debug("accounts:%@\nnew:%@", oldDef.dictionaryRepresentation, newDef.dictionaryRepresentation);
-
 }
 - (void)migrateDocuments
 {
@@ -244,6 +260,7 @@ static NSError * NewNSErrorFromException(NSException * exc) {
 
 - (void)loadAccounts
 {
+    Debug("storage: %@", _storage.dictionaryRepresentation);
     NSUserDefaults * standardUserDefaults = [NSUserDefaults standardUserDefaults];
     NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
     [center addObserver:self
@@ -255,7 +272,6 @@ static NSError * NewNSErrorFromException(NSException * exc) {
 
     NSMutableArray *connections = [[NSMutableArray alloc] init];
     NSArray *accounts = [self objectForKey:@"ACCOUNTS"];
-    Debug("accounts:%@", accounts);
     for (NSDictionary *account in accounts) {
         SeafConnection *conn = [[SeafConnection alloc] initWithUrl:[account objectForKey:@"url"] username:[account objectForKey:@"username"]];
         if (conn.username)
@@ -314,6 +330,11 @@ static NSError * NewNSErrorFromException(NSException * exc) {
         return __persistentStoreCoordinator;
     }
     NSURL *storeURL = [[self applicationDocumentsDirectoryURL] URLByAppendingPathComponent:@"seafile_pro.sqlite"];
+    Debug("storeURL: %@", storeURL);
+    if (!storeURL) {
+        Warning("nil store URL");
+        return nil;
+    }
 
     NSError *error = nil;
     __persistentStoreCoordinator = [[NSPersistentStoreCoordinator alloc] initWithManagedObjectModel:[self managedObjectModel]];
@@ -344,8 +365,7 @@ static NSError * NewNSErrorFromException(NSException * exc) {
         [[NSFileManager defaultManager] removeItemAtURL:storeURL error:nil];
 
         if (![__persistentStoreCoordinator addPersistentStoreWithType:NSSQLiteStoreType configuration:nil URL:storeURL options:nil error:&error]) {
-            NSLog(@"Unresolved error %@, %@", error, [error userInfo]);
-            abort();
+            Warning("Unresolved error %@, %@", error, [error userInfo]);
         }
     }
 
@@ -385,6 +405,13 @@ static NSError * NewNSErrorFromException(NSException * exc) {
 {
     @synchronized (self) {
         _downloadnum ++;
+    }
+}
+
+- (void)decDownloadnum
+{
+    @synchronized (self) {
+        _downloadnum --;
     }
 }
 
@@ -428,7 +455,7 @@ static NSError * NewNSErrorFromException(NSException * exc) {
 
     if (result) {
         self.failedNum = 0;
-        if (file.autoSync) {
+        if (file.autoSync && file.udir) {
             [file.udir->connection fileUploadedSuccess:file];
         }
     } else {
@@ -455,6 +482,7 @@ static NSError * NewNSErrorFromException(NSException * exc) {
         NSMutableArray *arr = [self.ufiles mutableCopy];
         for (SeafUploadFile *file in arr) {
             if (self.uploadingfiles.count + todo.count + self.failedNum >= 3) break;
+            Debug("ufile %@ canUpload:%d, uploaded:%d", file.lpath, file.canUpload, file.uploaded);
             if (!file.canUpload) continue;
             [self.ufiles removeObject:file];
             if (!file.uploaded) {
@@ -541,6 +569,7 @@ static NSError * NewNSErrorFromException(NSException * exc) {
         }
     }
     for (SeafUploadFile *ufile in arr) {
+        Debug("Remove autosync video file: %@, %@", ufile.lpath, ufile.assetURL);
         [ufile.udir removeUploadFile:ufile];
     }
 }
@@ -553,13 +582,15 @@ static NSError * NewNSErrorFromException(NSException * exc) {
         else
             Warning("upload task file %@ already exist", file.name);
     }
-    [self tryUpload];
+    [self performSelectorInBackground:@selector(tryUpload) withObject:file];
 }
 - (void)addDownloadTask:(id<SeafDownloadDelegate>)file
 {
     @synchronized (self) {
-        if (![_dfiles containsObject:file])
+        if (![_dfiles containsObject:file]) {
             [_dfiles addObject:file];
+            Debug("Added download task %@", file.name);
+        }
     }
     [self tryDownload];
 }
@@ -573,15 +604,16 @@ static NSError * NewNSErrorFromException(NSException * exc) {
     }
     @synchronized(timer) {
         for (SeafConnection *conn in self.conns) {
-            [conn pickPhotosForUpload];
-
+            [conn photosChanged:nil];
         }
         double cur = [[NSDate date] timeIntervalSince1970];
         if (cur - lastUpdate > UPDATE_INTERVAL) {
             Debug("%fs has passed, refreshRepoPassowrds", cur - lastUpdate);
             lastUpdate = cur;
-            for (SeafConnection *conn in self.conns)
+            for (SeafConnection *conn in self.conns) {
                 [conn refreshRepoPassowrds];
+                [conn photosChanged:nil];
+            }
         }
         if (self.ufiles.count > 0)
             [self tryUpload];
@@ -711,10 +743,183 @@ static NSError * NewNSErrorFromException(NSException * exc) {
 {
     return [self uniqueDirUnder:dir identify:[[NSUUID UUID] UUIDString]];
 }
+
 - (NSString *)uniqueUploadDir
 {
     return [self uniqueDirUnder:self.uploadsDir identify:[[NSUUID UUID] UUIDString]];
 }
 
+
+- (NSMutableDictionary *)getExports
+{
+    NSMutableDictionary *dict = [self objectForKey:@"EXPORTED"];
+    if (!dict)
+        return [NSMutableDictionary new];
+    else
+        return [[NSMutableDictionary alloc] initWithDictionary:dict];
+}
+
+- (void)saveExports:(NSDictionary *)dict
+{
+    [self setObject:dict forKey:@"EXPORTED"];
+    [self synchronize];
+}
+
+- (NSString *)exportKeyFor:(NSURL *)url
+{
+    NSArray *components = url.pathComponents;
+    NSUInteger length = components.count;
+    return [NSString stringWithFormat:@"%@/%@", [components objectAtIndex:length-2], [components objectAtIndex:length-1]];
+}
+
+- (void)addExportFile:(NSURL *)url data:(NSDictionary *)dict
+{
+    NSMutableDictionary *exports = [self getExports];
+    [exports setObject:dict forKey:[self exportKeyFor:url]];
+    Debug("exports: %@", exports);
+    [SeafGlobal.sharedObject saveExports:exports];
+}
+
+- (void)removeExportFile:(NSURL *)url
+{
+    NSMutableDictionary *exports = [self getExports];
+    [exports removeObjectForKey:[self exportKeyFor:url]];
+    Debug("exports: %@", exports);
+    [SeafGlobal.sharedObject saveExports:exports];
+}
+- (NSDictionary *)getExportFile:(NSURL *)url
+{
+    NSMutableDictionary *exports = [self getExports];
+    return [exports objectForKey:[self exportKeyFor:url]];
+}
+
+- (void)clearExportFiles
+{
+    [Utils clearAllFiles:SeafGlobal.sharedObject.documentStorageDir];
+    [SeafGlobal.sharedObject saveExports:[NSDictionary new]];
+}
+
+- (void)clearThumbs
+{
+    NSString *dir = [SeafGlobal.sharedObject applicationDocumentsDirectory];
+    NSError *error = nil;
+    BOOL isDirectory;
+    NSArray *dirContents = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:&error];
+
+    if (error) return;
+    for (NSString *entry in dirContents) {
+        if (![entry hasPrefix:@"thumb"] || entry.length < 40) continue;
+        NSString *path = [dir stringByAppendingPathComponent:entry];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:path isDirectory:&isDirectory]
+            && !isDirectory) {
+            [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+        }
+    }
+}
+
+- (void)clearCache
+{
+    Debug("clear local cache.");
+    [Utils clearAllFiles:SeafGlobal.sharedObject.objectsDir];
+    [Utils clearAllFiles:SeafGlobal.sharedObject.blocksDir];
+    [Utils clearAllFiles:SeafGlobal.sharedObject.editDir];
+    [Utils clearAllFiles:SeafGlobal.sharedObject.thumbsDir];
+    [Utils clearAllFiles:SeafGlobal.sharedObject.tempDir];
+    [SeafUploadFile clearCache];
+    [SeafAvatar clearCache];
+    [self clearThumbs];
+
+    [SeafGlobal.sharedObject clearExportFiles];
+    [SeafGlobal.sharedObject deleteAllObjects:@"Directory"];
+    [SeafGlobal.sharedObject deleteAllObjects:@"DownloadedFile"];
+    [SeafGlobal.sharedObject deleteAllObjects:@"SeafCacheObj"];
+}
+
+- (NSArray *)getSecPersistentRefs {
+    NSArray *array = (NSArray *)[self objectForKey:@"SecPersistentRefs"];
+    return array;
+}
+
+- (void)loadSecIdentities
+{
+    _secIdentities = [NSMutableDictionary new];
+    NSArray *array = [self getSecPersistentRefs];
+    if (array) {
+        for (NSData *data in array) {
+            SecIdentityRef identity = [SecurityUtilities getSecIdentityForPersistentRef:(CFDataRef)data];
+            [_secIdentities setObject:(__bridge id)identity forKey:data];
+        }
+    }
+}
+
+- (void)saveSecIdentities
+{
+    NSArray *array = _secIdentities.allKeys;
+    [self setObject:array forKey:@"SecPersistentRefs"];
+}
+
+- (NSDictionary *)getAllSecIdentities
+{
+    return _secIdentities;
+}
+
+- (BOOL)importCert:(NSString *)certificatePath password:(NSString *)keyPassword
+{
+    SecIdentityRef identity = [SecurityUtilities copyIdentityAndTrustWithCertFile:certificatePath password:keyPassword];
+    if (!identity) {
+        Warning("Wrong password");
+        return false;
+    }
+
+    NSData *data = (__bridge NSData *)[SecurityUtilities saveSecIdentity:identity];
+    if (data) {
+        [_secIdentities setObject:(__bridge id)identity forKey:data];
+        [self saveSecIdentities];
+        return true;
+    } else {
+        Warning("Failed to save to keyChain");
+        return false;
+    }
+}
+
+- (BOOL)removeIdentity:(SecIdentityRef)identity forPersistentRef:(CFDataRef)persistentRef
+{
+    BOOL ret = [SecurityUtilities removeIdentity:identity forPersistentRef:persistentRef];
+    Debug("Remove identity from keychain: %d", ret);
+    if (ret) {
+        [_secIdentities removeObjectForKey:(__bridge id)persistentRef];
+    }
+    return ret;
+}
+
+- (NSURLCredential *)getCredentialForKey:(id)key
+{
+    SecIdentityRef identity = (__bridge SecIdentityRef)[_secIdentities objectForKey:key];
+    if (identity) {
+        return [SecurityUtilities getCredentialFromSecIdentity:identity];
+    }
+    return nil;
+}
+
+-(void)chooseCertFrom:(NSDictionary *)dict handler:(void (^)(CFDataRef persistentRef, SecIdentityRef identity)) completeHandler from:(UIViewController *)c
+{
+    NSString *title = NSLocalizedString(@"Select a certificate", @"Seafile");
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:title message:nil preferredStyle:UIAlertControllerStyleAlert];
+    for(NSData *key in dict) {
+        CFDataRef persistentRef = (__bridge CFDataRef)key;
+        SecIdentityRef identity = (__bridge SecIdentityRef)dict[key];
+        NSString *title = [SecurityUtilities nameForIdentity:identity];
+        UIAlertAction *action = [UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+            completeHandler(persistentRef, identity);
+        }];
+        [alert addAction:action];
+    }
+
+    UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:STR_CANCEL style:UIAlertActionStyleCancel handler:^(UIAlertAction *action) {
+        completeHandler(nil, nil);
+    }];
+    [alert addAction:cancelAction];
+    [c presentViewController:alert animated:YES completion:nil];
+}
 
 @end

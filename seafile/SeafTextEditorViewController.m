@@ -42,7 +42,7 @@
 
 - (UIBarButtonItem *)getTextBarItem:(NSString *)title action:(SEL)action active:(int)active
 {
-    UIBarButtonItem *item = [[UIBarButtonItem alloc] initWithTitle:title style:UIBarButtonItemStyleBordered target:self action:action];
+    UIBarButtonItem *item = [[UIBarButtonItem alloc] initWithTitle:title style:UIBarButtonItemStylePlain target:self action:action];
     return item;
 }
 
@@ -107,7 +107,7 @@
     NSDictionary *info = [aNotification userInfo];
     CGSize kbSize = [info[UIKeyboardFrameBeginUserInfoKey] CGRectValue].size;
     UIEdgeInsets contentInsets = UIEdgeInsetsMake(0.0, 0.0, kbSize.height, 0.0);
-    
+
     self.textView.contentInset = contentInsets;
     self.textView.scrollIndicatorInsets = contentInsets;
 }

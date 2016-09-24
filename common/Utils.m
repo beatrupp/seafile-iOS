@@ -66,6 +66,8 @@
 + (BOOL)removeFile:(NSString *)path
 {
     NSError *error = nil;
+    if (![[NSFileManager defaultManager] fileExistsAtPath:path])
+        return true;
     BOOL ret = [[NSFileManager defaultManager] removeItemAtPath:path error:&error];
     if (!ret)
         Warning("Failed to remove file %@: %@", path, error);
@@ -104,7 +106,7 @@
 
 + (BOOL)linkFileAtPath:(NSString *)from to:(NSString *)to
 {
-    if (!from || !to) return false;
+    if (!from || !to || [Utils fileExistsAtPath:to]) return false;
     NSError *error = nil;
     NSFileManager* fm = [NSFileManager defaultManager];
     if ([fm fileExistsAtPath:to]
@@ -449,6 +451,22 @@
     });
 }
 
++ (UIAlertController *)generateAlert:(NSArray *)arr withTitle:(NSString *)title handler:(void (^ __nullable)(UIAlertAction *action))handler cancelHandler:(void (^ __nullable)(UIAlertAction *action))cancelHandler preferredStyle:(UIAlertControllerStyle)preferredStyle
+{
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:title message:nil preferredStyle:preferredStyle];
+    for (NSString *name in arr) {
+        UIAlertAction *action = [UIAlertAction actionWithTitle:name style:UIAlertActionStyleDefault handler:handler];
+        [alert addAction:action];
+    }
+    if (!IsIpad() || cancelHandler){
+        UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:STR_CANCEL style:UIAlertActionStyleCancel handler:^(UIAlertAction *action) {
+            if (cancelHandler) cancelHandler(action);
+        }];
+        [alert addAction:cancelAction];
+    }
+    return alert;
+}
+
 + (UIImage *)reSizeImage:(UIImage *)image toSquare:(float)length
 {
     CGSize reSize;
@@ -490,4 +508,5 @@
             [dict setObject:value forKey:defaultName];
     }
 }
+
 @end

@@ -6,13 +6,11 @@
 //  Copyright (c) 2013 Seafile Ltd. All rights reserved.
 //
 
-#import "SeafCell.h"
+#import "SeafEventCell.h"
 
-@implementation SeafCell
-@synthesize imageView;
+@implementation SeafEventCell
 @synthesize textLabel;
 @synthesize detailTextLabel;
-@synthesize progressView;
 
 - (id)initWithStyle:(UITableViewCellStyle)style reuseIdentifier:(NSString *)reuseIdentifier
 {
@@ -28,17 +26,6 @@
     [super setSelected:selected animated:animated];
 
     // Configure the view for the selected state
-}
-
-- (void)reset
-{
-    self.detailTextLabel.text = nil;
-    self.badgeImage.hidden = true;
-    self.badgeLabel.hidden = true;
-    self.cacheStatusView.hidden = true;
-    self.progressView.hidden = true;
-    self.rightUtilityButtons = nil;
-    self.delegate = nil;
 }
 
 @end

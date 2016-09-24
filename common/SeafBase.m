@@ -143,6 +143,7 @@
     [connection sendPost:request_str form:formString
                  success:^(NSURLRequest *request, NSHTTPURLResponse *response, id JSON) {
                      Debug("Set repo %@ password success.", self.repoId);
+                     [connection setRepo:self.repoId password:password];
                      if (block)  block(self, RET_SUCCESS);
                  } failure:^(NSURLRequest *request, NSHTTPURLResponse *response, id JSON, NSError *error) {
                      int ret = RET_FAILED;
@@ -170,35 +171,40 @@
     SeafRepo *repo = [connection getRepo:self.repoId];
     Debug("check magic %@, %@", repo.magic, password);
     if (!repo.magic || !repo.encKey) {
-        if (block) block(self, RET_FAILED);
-        return;
+        return block(self, RET_FAILED);
     }
     NSString *magic = [NSData passwordMaigc:password repo:self.repoId version:2];
     if ([magic isEqualToString:repo.magic]) {
-        if (block)  block(self, RET_SUCCESS);
+        block(self, RET_SUCCESS);
     } else {
-        if (block)  block(self, RET_WRONG_PASSWORD);
+        block(self, RET_WRONG_PASSWORD);
     }
 }
 
-- (void)checkRepoPassword:(NSString *)password block:(void(^)(SeafBase *, int))block
+- (void)checkRepoPassword:(NSString *)password block:(repo_password_set_block_t)block
 {
     if (!self.repoId) {
         if (block) block(self, RET_FAILED);
         return;
     }
+    repo_password_set_block_t handler = ^(SeafBase *entry, int ret) {
+        if (ret == RET_SUCCESS)
+            [connection setRepo:self.repoId password:password];
+        if (block)
+            block(entry, ret);
+    };
+
     int version = [[connection getRepo:self.repoId] encVersion];
     if (version == 2)
-        return [self checkRepoPasswordV2:password block:block];
+        return [self checkRepoPasswordV2:password block:handler];
     NSString *magic = [NSData passwordMaigc:password repo:self.repoId version:version];
     NSString *request_str = [NSString stringWithFormat:API_URL"/repos/%@/?op=checkpassword", self.repoId];
     NSString *formString = [NSString stringWithFormat:@"magic=%@", [magic escapedPostForm]];
     [connection sendPost:request_str form:formString
                  success:^(NSURLRequest *request, NSHTTPURLResponse *response, id JSON) {
-                     [connection setRepo:self.repoId password:password];
-                     if (block)  block(self, true);
+                     handler(self, true);
                  } failure:^(NSURLRequest *request, NSHTTPURLResponse *response, id JSON, NSError *error) {
-                     if (block)  block(self, false);
+                     handler(self, false);
                  } ];
 }
 - (void)checkRepoPassword:(NSString *)password delegate:(id<SeafRepoPasswordDelegate>)del
@@ -210,14 +216,9 @@
     }];
 }
 
-- (BOOL)localDecrypt
-{
-    return [connection localDecrypt:self.repoId];
-}
-
 - (void)checkOrSetRepoPassword:(NSString *)password delegate:(id<SeafRepoPasswordDelegate>)del
 {
-    if ([self localDecrypt])
+    if ([connection localDecrypt:self.repoId])
         [self checkRepoPassword:password delegate:del];
     else
         [self setRepoPassword:password delegate:del];
@@ -225,7 +226,7 @@
 
 - (void)checkOrSetRepoPassword:(NSString *)password block:(void(^)(SeafBase *entry, int ret))block
 {
-    if ([self localDecrypt])
+    if ([connection localDecrypt:self.repoId])
         [self checkRepoPassword:password block:block];
     else
         [self setRepoPassword:password block:block];

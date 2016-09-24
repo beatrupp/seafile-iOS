@@ -11,6 +11,8 @@
 #import "SeafDir.h"
 #import "SeafConnection.h"
 #import "SeafGlobal.h"
+#import "SeafDateFormatter.h"
+
 
 #import "ExtentedString.h"
 #import "Debug.h"
@@ -19,7 +21,6 @@
 #define KEY_REPOS @"REPOS"
 
 @interface SeafRepo ()
-@property (readonly) NSString *perm;
 
 @end
 @implementation SeafRepo;
@@ -43,11 +44,10 @@
     NSString *aMime = @"text/directory-documents";
     if (aEncrypted)
         aMime = @"text/directory-documents-encrypted";
-    if (self = [super initWithConnection:aConnection oid:anId repoId:aRepoId name:aName path:@"/" mime:aMime]) {
+    if (self = [super initWithConnection:aConnection oid:anId repoId:aRepoId perm:aPerm name:aName path:@"/" mime:aMime]) {
         _desc = aDesc;
         _owner = aOwner;
         _repoType = aRepoType;
-        _perm = aPerm;
         _size = aSize;
         _mtime = aMtime;
         _encrypted = aEncrypted;
@@ -65,13 +65,6 @@
         return YES;
     else
         return NO;
-}
-
-- (BOOL)editable
-{
-    if (_perm && [_perm isKindOfClass:[NSString class]])
-        return [_perm.lowercaseString isEqualToString:@"rw"];
-    return NO;
 }
 
 - (NSString *)key
@@ -99,14 +92,27 @@
 
 - (BOOL)canLocalDecrypt
 {
-#if 1
     //Debug("localDecrypt %d version:%d, magic:%@", self.encrypted, self.encVersion, self.magic);
     return self.encrypted && self.encVersion >= 2 && self.magic;
-#else
-    return false;
-#endif
 }
 
+- (NSString *)detailText
+{
+    NSString *detail = [SeafDateFormatter stringFromLongLong:self.mtime];
+    if ([SHARE_REPO isEqualToString:self.type]) {
+        NSString *name = self.owner;
+        unsigned long index = [self.owner indexOf:'@'];
+        if (index != NSNotFound)
+            name = [self.owner substringToIndex:index];
+        detail = [detail stringByAppendingFormat:@", %@", name];
+    }
+    return detail;
+}
+
+- (BOOL)isGroupRepo
+{
+    return [GROUP_REPO isEqualToString:self.type];
+}
 @end
 
 
@@ -150,7 +156,6 @@
         [repoGroup addObject:srepos];
 
     for (NSString *groupName in grepos) {
-        Debug("Add %@", groupName);
         [repoGroup addObject:[grepos objectForKey:groupName]];
     }
 
@@ -184,7 +189,6 @@
         newRepo.delegate = self.delegate;
         [newRepos addObject:newRepo];
     }
-
     [self loadedItems:newRepos];
     [self groupingRepos];
     [self.delegate download:self complete:true];
@@ -198,7 +202,7 @@
 }
 
 
-//$ curl -D a.txt -H 'Cookie:seahubsessionid=7eb567868b5df5b22b2ba2440854589c' http://www.gonggeng.org/seahub/api/repo/list/
+//$ curl -D a.txt -H 'Cookie:seahubsessionid=7eb567868b5df5b22b2ba2440854589c' https://seacloud.cc/api/repo/list/
 // [{"password_need": false, "name": "test", "mtime": null, "owner": "pithier@163.com", "root": "e6098c7bfc18bb0221eac54988649ed3b884f901", "size": [7224782], "type": "repo", "id": "640fd90d-ef4e-490d-be1c-b34c24040da7", "desc": "dasdadwd"}]
 - (void)realLoadContent
 {
@@ -248,9 +252,16 @@
 
 - (void)reSortItems
 {
+    NSMutableArray *allrepos = [[NSMutableArray alloc] init];
     for (NSMutableArray *repoGroup in _repoGroups) {
         [self sortItems:repoGroup];
+        [allrepos addObjectsFromArray:repoGroup];
     }
+    self.items = allrepos;
 }
 
+- (BOOL)editable
+{
+    return NO;
+}
 @end

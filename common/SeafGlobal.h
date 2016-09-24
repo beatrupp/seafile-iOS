@@ -36,6 +36,8 @@
 
 @property (retain) NSMutableArray *conns;
 @property (readwrite) SeafConnection *connection;
+@property (readonly) NSString *clientVersion;
+@property (readonly) NSString *platformVersion;
 
 
 + (SeafGlobal *)sharedObject;
@@ -49,6 +51,7 @@
 - (NSString *)thumbsDir;
 - (NSString *)objectsDir;
 - (NSString *)blocksDir;
+- (NSString *)documentStorageDir;
 
 
 - (NSString *)documentPath:(NSString*)fileId;
@@ -66,6 +69,7 @@
 - (void)deleteAllObjects: (NSString *)entityDescription;
 
 - (void)incDownloadnum;
+- (void)decDownloadnum;
 - (unsigned long)uploadingnum;
 - (unsigned long)downloadingnum;
 
@@ -93,6 +97,18 @@
 
 - (NSString *)uniqueDirUnder:(NSString *)dir;
 - (NSString *)uniqueUploadDir;
+- (void)addExportFile:(NSURL *)url data:(NSDictionary *)dict;
+- (void)removeExportFile:(NSURL *)url;
+- (NSDictionary *)getExportFile:(NSURL *)url;
+- (void)clearExportFiles;
+
+- (void)clearCache;
+
+- (NSDictionary *)getAllSecIdentities;
+- (BOOL)importCert:(NSString *)certificatePath password:(NSString *)keyPassword;
+- (BOOL)removeIdentity:(SecIdentityRef)identity forPersistentRef:(CFDataRef)persistentRef;
+- (void)chooseCertFrom:(NSDictionary *)dict handler:(void (^)(CFDataRef persistentRef, SecIdentityRef identity)) completeHandler from:(UIViewController *)c;
+- (NSURLCredential *)getCredentialForKey:(id)key;
 
 @end
 

@@ -7,7 +7,7 @@
 //
 
 #import <UIKit/UIKit.h>
-#import <SWTableViewCell.h>
+#import "SWTableViewCell.h"
 
 @interface SeafCell : SWTableViewCell
 @property (strong, nonatomic) IBOutlet UIImageView *imageView;
@@ -19,5 +19,9 @@
 @property (strong, nonatomic) IBOutlet UIImageView *downloadStatusImageView;
 @property (strong, nonatomic) IBOutlet NSLayoutConstraint *cacheStatusWidthConstraint;
 @property (strong, nonatomic) IBOutlet UIActivityIndicatorView *downloadingIndicator;
+
+@property (strong, nonatomic) IBOutlet UIProgressView *progressView;
+
+- (void)reset;
 
 @end

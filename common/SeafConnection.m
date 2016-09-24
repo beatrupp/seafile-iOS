@@ -100,7 +100,7 @@ static AFHTTPRequestSerializer <AFURLRequestSerialization> * _requestSerializer;
 @property NSMutableArray *uploadingArray;
 @property SeafDir *syncDir;
 @property (readonly) NSString *localUploadDir;
-
+@property NSURLCredential *clientCred;
 @end
 
 @implementation SeafConnection
@@ -158,10 +158,21 @@ static AFHTTPRequestSerializer <AFURLRequestSerialization> * _requestSerializer;
         else
             _settings = [[NSMutableDictionary alloc] init];
     }
+    id clientIdentityKey = [_info objectForKey:@"identity"];
+    if (clientIdentityKey) {
+        self.clientCred = [SeafGlobal.sharedObject getCredentialForKey:clientIdentityKey];
+        Debug("Load client dentit");
+    }
+
+    if (self.authorized && ![self serverInfo]) {
+        [self getServerInfo:^(bool result) {}];
+    }
     if (self.autoClearRepoPasswd) {
         Debug("Clear repo apsswords for %@ %@", url, username);
         [self clearRepoPasswords];
     }
+    if (self.autoSync)
+        [_rootFolder loadContent:NO];
     return self;
 }
 
@@ -175,10 +186,10 @@ static AFHTTPRequestSerializer <AFURLRequestSerialization> * _requestSerializer;
         }
         [Utils checkMakeDir:_localUploadDir];
     }
-   
+
     return _localUploadDir;
 }
- 
+
 - (void)saveSettings
 {
     [SeafGlobal.sharedObject setObject:_settings forKey:[NSString stringWithFormat:@"%@/%@/settings", _address, self.username]];
@@ -208,6 +219,37 @@ static AFHTTPRequestSerializer <AFURLRequestSerialization> * _requestSerializer;
 - (BOOL)authorized
 {
     return self.token != nil;
+}
+
+- (BOOL)isFeatureEnabled:(NSString *)feature
+{
+    NSDictionary *serverInfo = [self serverInfo];
+    if (!serverInfo)
+        return true;
+    NSArray *features = [serverInfo objectForKey:@"features"];
+    if ([features containsObject:feature])
+        return true;
+    return false;
+}
+
+- (BOOL)isSearchEnabled
+{
+    return [self isFeatureEnabled:@"file-search"];
+}
+
+- (BOOL)isActivityEnabled
+{
+    return [self isFeatureEnabled:@"seafile-pro"];
+}
+
+- (NSDictionary *)serverInfo
+{
+    return [_settings objectForKey:@"serverInfo"];
+}
+
+- (void)setServerInfo:(NSDictionary *)info
+{
+    [self setAttribute:info forKey:@"serverInfo"];
 }
 
 - (BOOL)isWifiOnly
@@ -294,6 +336,7 @@ static AFHTTPRequestSerializer <AFURLRequestSerialization> * _requestSerializer;
 
 - (void)setAutoSyncRepo:(NSString *)repoId
 {
+    _syncDir = nil;
     [self setAttribute:repoId forKey:@"autoSyncRepo"];
 }
 
@@ -371,13 +414,12 @@ static AFHTTPRequestSerializer <AFURLRequestSerialization> * _requestSerializer;
 
     AFHTTPSessionManager *manager = [[AFHTTPSessionManager alloc] initWithSessionConfiguration:configuration];
     [manager setSessionDidReceiveAuthenticationChallengeBlock:^NSURLSessionAuthChallengeDisposition(NSURLSession *session, NSURLAuthenticationChallenge *challenge, NSURLCredential *__autoreleasing *credential) {
-        *credential = [NSURLCredential credentialForTrust:challenge.protectionSpace.serverTrust];
-        if (SeafGlobal.sharedObject.allowInvalidCert) return NSURLSessionAuthChallengeUseCredential;
-
         if ([challenge.protectionSpace.authenticationMethod isEqualToString:NSURLAuthenticationMethodServerTrust]) {
+            if (SeafGlobal.sharedObject.allowInvalidCert) return NSURLSessionAuthChallengeUseCredential;
+
             *credential = [NSURLCredential credentialForTrust:challenge.protectionSpace.serverTrust];
             BOOL valid = SeafServerTrustIsValid(challenge.protectionSpace.serverTrust);
-            Debug("Server cert is valid: %d, delegate=%@, inCheckCert=%d", valid, self.delegate, self.inCheckCert);
+            Debug("Server cert is valid: %d, delegate=%@, inCheckCert=%d, credential:%@", valid, self.delegate, self.inCheckCert, *credential);
             if (valid) {
                 [[NSFileManager defaultManager] removeItemAtPath:[self certPathForHost:challenge.protectionSpace.host] error:nil];
                 if ([challenge.protectionSpace.host isEqualToString:self.host]) {
@@ -386,20 +428,32 @@ static AFHTTPRequestSerializer <AFURLRequestSerialization> * _requestSerializer;
                 }
                 return NSURLSessionAuthChallengeUseCredential;
             } else {
-                if (!self.delegate) return NSURLSessionAuthChallengeCancelAuthenticationChallenge;
+                if (!self.loginDelegate) return NSURLSessionAuthChallengeCancelAuthenticationChallenge;
                 @synchronized(self) {
                     if (self.inCheckCert)
                         return NSURLSessionAuthChallengeCancelAuthenticationChallenge;
                     self.inCheckCert = true;
                 }
-                BOOL yes = [self.delegate continueWithInvalidCert:challenge.protectionSpace];
-                NSURLSessionAuthChallengeDisposition dis = yes?NSURLSessionAuthChallengeUseCredential: NSURLSessionAuthChallengeCancelAuthenticationChallenge;
+                BOOL yes = [self.loginDelegate authorizeInvalidCert:challenge.protectionSpace];
+                NSURLSessionAuthChallengeDisposition dis = yes ? NSURLSessionAuthChallengeUseCredential: NSURLSessionAuthChallengeCancelAuthenticationChallenge;
                 if (yes)
                     [self saveCertificate:challenge.protectionSpace];
 
                 self.inCheckCert = false;
                 return dis;
             }
+        } else if ([challenge.protectionSpace.authenticationMethod isEqualToString:NSURLAuthenticationMethodClientCertificate]) {
+            Debug("Use NSURLAuthenticationMethodClientCertificate");
+            if (!self.loginDelegate) return NSURLSessionAuthChallengeCancelAuthenticationChallenge;
+            id key = [self.loginDelegate getClientCertPersistentRef:credential];
+            if (key == nil){
+                return NSURLSessionAuthChallengeCancelAuthenticationChallenge;
+            } else {
+                self.clientCred = *credential;
+                [Utils dict:_info setObject:key forKey:@"identity"];
+                return NSURLSessionAuthChallengeUseCredential;
+            }
+        } else {
         }
         return NSURLSessionAuthChallengePerformDefaultHandling;
     }];
@@ -411,26 +465,39 @@ static AFHTTPRequestSerializer <AFURLRequestSerialization> * _requestSerializer;
     return _policy;
 }
 
+-(BOOL)validateServerrust:(SecTrustRef)serverTrust withPolicy:(AFSecurityPolicy *)policy forDomain:(NSString *)domain
+{
+    if (policy) {
+        return [policy evaluateServerTrust:serverTrust forDomain:domain];
+    } else {
+        return SeafServerTrustIsValid(serverTrust);
+    }
+}
+
 - (void)setPolicy:(AFSecurityPolicy *)policy
 {
     _policy = policy;
     _sessionMgr.securityPolicy = _policy;
-    if (!_policy) {
-        [_sessionMgr setSessionDidReceiveAuthenticationChallengeBlock:^NSURLSessionAuthChallengeDisposition(NSURLSession *session, NSURLAuthenticationChallenge *challenge, NSURLCredential *__autoreleasing *credential) {
+    __weak typeof(self) weakSelf = self;
+
+    [_sessionMgr setSessionDidReceiveAuthenticationChallengeBlock:^NSURLSessionAuthChallengeDisposition(NSURLSession *session, NSURLAuthenticationChallenge *challenge, NSURLCredential *__autoreleasing *credential) {
+        if ([challenge.protectionSpace.authenticationMethod isEqualToString:NSURLAuthenticationMethodServerTrust]) {
+            *credential = [NSURLCredential credentialForTrust:challenge.protectionSpace.serverTrust];
             if (SeafGlobal.sharedObject.allowInvalidCert) return NSURLSessionAuthChallengeUseCredential;
-            if ([challenge.protectionSpace.authenticationMethod isEqualToString:NSURLAuthenticationMethodServerTrust]) {
-                *credential = [NSURLCredential credentialForTrust:challenge.protectionSpace.serverTrust];
-                if (SeafServerTrustIsValid(challenge.protectionSpace.serverTrust)) {
-                    return NSURLSessionAuthChallengeUseCredential;
-                } else {
-                    return NSURLSessionAuthChallengeCancelAuthenticationChallenge;
-                }
+            if ([weakSelf validateServerrust:challenge.protectionSpace.serverTrust withPolicy:weakSelf.policy forDomain:challenge.protectionSpace.host]) {
+                return NSURLSessionAuthChallengeUseCredential;
+            } else {
+                return NSURLSessionAuthChallengeCancelAuthenticationChallenge;
             }
-            return NSURLSessionAuthChallengePerformDefaultHandling;
-        }];
-    } else {
-        [_sessionMgr setSessionDidReceiveAuthenticationChallengeBlock:nil];
-    }
+        } else if ([challenge.protectionSpace.authenticationMethod isEqualToString:NSURLAuthenticationMethodClientCertificate]) {
+            if (weakSelf.clientCred != nil) {
+                *credential = self.clientCred;
+                return NSURLSessionAuthChallengeUseCredential;
+            } else
+                return NSURLSessionAuthChallengePerformDefaultHandling;
+        }
+        return NSURLSessionAuthChallengePerformDefaultHandling;
+    }];
 }
 
 - (BOOL)localDecrypt:(NSString *)repoId
@@ -455,6 +522,15 @@ static AFHTTPRequestSerializer <AFURLRequestSerialization> * _requestSerializer;
         _localUploadDir = nil;
     }
 }
+- (void)logout
+{
+    _token = nil;
+    [_info removeObjectForKey:@"token"];
+    [_info removeObjectForKey:@"password"];
+    [_info removeObjectForKey:@"repopassword"];
+    [self saveSettings];
+}
+
 - (void)clearAccount
 {
     [SeafGlobal.sharedObject removeObjectForKey:_address];
@@ -472,7 +548,7 @@ static AFHTTPRequestSerializer <AFURLRequestSerialization> * _requestSerializer;
     [SeafGlobal.sharedObject synchronize];
 
 }
-- (void)getAccountInfo:(void (^)(bool result, SeafConnection *conn))handler
+- (void)getAccountInfo:(void (^)(bool result))handler
 {
     [self sendRequest:API_URL"/account/info/"
               success:
@@ -490,11 +566,11 @@ static AFHTTPRequestSerializer <AFURLRequestSerialization> * _requestSerializer;
              [Utils dict:_info setObject:newUsername forKey:@"username"];
          }
          [self saveAccountInfo];
-         if (handler) handler(true, self);
+         if (handler) handler(true);
      }
               failure:
      ^(NSURLRequest *request, NSHTTPURLResponse *response, id JSON, NSError *error) {
-         if (handler) handler(false, self);
+         if (handler) handler(false);
      }];
 }
 
@@ -504,6 +580,7 @@ static AFHTTPRequestSerializer <AFURLRequestSerialization> * _requestSerializer;
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:[url stringByAppendingString:API_URL"/auth-token/"]]];
     [request setHTTPMethod:@"POST"];
     [request setValue:@"application/x-www-form-urlencoded; charset=UTF-8" forHTTPHeaderField:@"Content-Type"];
+
     NSDictionary *infoDictionary = [[NSBundle mainBundle] infoDictionary];
     NSString *version = [infoDictionary objectForKey:@"CFBundleVersion"];
     NSString *platform = @"ios";
@@ -525,25 +602,41 @@ static AFHTTPRequestSerializer <AFURLRequestSerialization> * _requestSerializer;
     [Utils dict:_info setObject:_address forKey:@"link"];
     [Utils dict:_info setObject:[NSNumber numberWithBool:isshib] forKey:@"isshibboleth"];
     [self saveAccountInfo];
-    [self downloadAvatar:true];
     [self.loginDelegate loginSuccess:self];
+
+    dispatch_time_t delayTime = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC));
+    dispatch_after(delayTime, dispatch_get_main_queue(), ^{
+        [self downloadAvatar:true];
+    });
+}
+
+-(void)showDeserializedError:(NSError *)error
+{
+    NSData *data = [error.userInfo objectForKey:@"com.alamofire.serialization.response.error.data"];
+    if (data && [data isKindOfClass:[NSData class]]) {
+        NSString *str __attribute__((unused)) = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        Debug("%@ DeserializedErro: %@", _address, str);
+    }
 }
 
 /*
- curl -D a.txt --data "username=pithier@163.com&password=pithier" http://www.gonggeng.org/seahub/api2/auth-token/
+ curl -D a.txt --data "username=xx@seafile.com&password=xx" https://seacloud.cc/api2/auth-token/
  */
-- (void)loginWithUsername:(NSString *)username password:(NSString *)password
+- (void)loginWithUsername:(NSString *)username password:(NSString *)password otp:(NSString *)otp
 {
     NSString *url = _address;
     NSMutableURLRequest *request = [self loginRequest:url username:username password:password];
+    if (otp)
+        [request setValue:otp forHTTPHeaderField:@"X-Seafile-OTP"];
     AFHTTPSessionManager *manager = self.loginMgr;
     manager.responseSerializer = [AFJSONResponseSerializer serializer];
 
     Debug("Login: %@ %@", url, username);
     NSURLSessionDataTask *dataTask = [manager dataTaskWithRequest:request completionHandler:^(NSURLResponse *response, id responseObject, NSError *error) {
         if (error) {
-            Warning("Error: %@", error);
-            [self.loginDelegate loginFailed:self error:error code:((NSHTTPURLResponse *)response).statusCode];
+            Warning("Error: %@, response:%@", error, responseObject);
+            [self showDeserializedError:error];
+            [self.loginDelegate loginFailed:self response:response error:error];
         } else {
             [Utils dict:_info setObject:password forKey:@"password"];
             [self setToken:[responseObject objectForKey:@"token"] forUser:username isShib:false];
@@ -553,10 +646,18 @@ static AFHTTPRequestSerializer <AFURLRequestSerialization> * _requestSerializer;
     [dataTask resume];
 }
 
+- (void)loginWithUsername:(NSString *)username password:(NSString *)password
+{
+    [self loginWithUsername:username password:password otp:nil];
+}
+
 - (NSURLRequest *)buildRequest:(NSString *)url method:(NSString *)method form:(NSString *)form
 {
     NSString *absoluteUrl = [url hasPrefix:@"http"] ? url : [_address stringByAppendingString:url];
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:absoluteUrl]];
+    [request setValue:SeafGlobal.sharedObject.clientVersion forHTTPHeaderField:@"X-Seafile-Client-Version"];
+    [request setValue:SeafGlobal.sharedObject.platformVersion forHTTPHeaderField:@"X-Seafile-Platform-Version"];
+
     [request setTimeoutInterval:DEFAULT_TIMEOUT];
     [request setHTTPMethod:method];
     if (form) {
@@ -568,7 +669,6 @@ static AFHTTPRequestSerializer <AFURLRequestSerialization> * _requestSerializer;
     if (self.token)
         [request setValue:[NSString stringWithFormat:@"Token %@", self.token] forHTTPHeaderField:@"Authorization"];
 
-    Debug("Request: %@", request.URL);
     return request;
 }
 
@@ -577,17 +677,24 @@ static AFHTTPRequestSerializer <AFURLRequestSerialization> * _requestSerializer;
                  failure:(void (^)(NSURLRequest *request, NSHTTPURLResponse *response, id JSON, NSError *error))failure
 {
     NSURLRequest *request = [self buildRequest:url method:method form:form];
+    Debug("Request: %@", request.URL);
+
     NSURLSessionDataTask *task = [_sessionMgr dataTaskWithRequest:request completionHandler:^(NSURLResponse *response, id responseObject, NSError *error) {
         NSHTTPURLResponse *resp = (NSHTTPURLResponse *)response;
         if (error) {
-            Warning("Error: %@, token=%@, resp=%@, delegate=%@, url=%@", error, _token, responseObject, self.delegate, url);
+            [self showDeserializedError:error];
+            Warning("token=%@, resp=%@, delegate=%@, url=%@, Error: %@", _token, responseObject, self.delegate, url, error);
             failure (request, resp, responseObject, error);
             if (resp.statusCode == HTTP_ERR_UNAUTHORIZED) {
+                NSString *wiped = [resp.allHeaderFields objectForKey:@"X-Seafile-Wiped"];
+                Debug("wiped: %@", wiped);
                 @synchronized(self) {
                     if (![self authorized])   return;
                     _token = nil;
                     [_info removeObjectForKey:@"token"];
                     [self saveAccountInfo];
+                    if (wiped)
+                        [SeafGlobal.sharedObject clearCache];
                 }
                 if (self.delegate) [self.delegate loginRequired:self];
             }
@@ -749,6 +856,26 @@ static AFHTTPRequestSerializer <AFURLRequestSerialization> * _requestSerializer;
      }];
 }
 
+- (void)getServerInfo:(void (^)(bool result))handler
+{
+    [self sendRequest:API_URL"/server-info/"
+              success:
+     ^(NSURLRequest *request, NSHTTPURLResponse *response, id JSON) {
+         @synchronized(self) {
+             Debug("Success to get server info: %@\n", JSON);
+             [self setServerInfo:JSON];
+             if (handler)
+                 handler (true);
+         }
+     }
+              failure:
+     ^(NSURLRequest *request, NSHTTPURLResponse *response, id JSON, NSError *error) {
+         if (handler)
+             handler (false);
+     }];
+}
+
+
 - (BOOL)isStarred:(NSString *)repo path:(NSString *)path
 {
     NSString *key = [NSString stringWithFormat:@"%@-%@", repo, path];
@@ -798,12 +925,14 @@ static AFHTTPRequestSerializer <AFURLRequestSerialization> * _requestSerializer;
 - (SeafUploadFile *)getUploadfile:(NSString *)lpath create:(bool)create
 {
     if (!lpath) return nil;
-    SeafUploadFile *ufile = [self.uploadFiles objectForKey:lpath];
-    if (!ufile && create) {
-        ufile = [[SeafUploadFile alloc] initWithPath:lpath];
-        [Utils dict:self.uploadFiles setObject:ufile forKey:lpath];
-    }
-    return ufile;
+    @synchronized(self.uploadFiles) {
+        SeafUploadFile *ufile = [self.uploadFiles objectForKey:lpath];
+        if (!ufile && create) {
+            ufile = [[SeafUploadFile alloc] initWithPath:lpath];
+            [Utils dict:self.uploadFiles setObject:ufile forKey:lpath];
+        }
+        return ufile;
+    };
 }
 
 - (SeafUploadFile *)getUploadfile:(NSString *)lpath
@@ -813,14 +942,18 @@ static AFHTTPRequestSerializer <AFURLRequestSerialization> * _requestSerializer;
 
 - (void)removeUploadfile:(SeafUploadFile *)ufile
 {
-    [self.uploadFiles removeObjectForKey:ufile.lpath];
+    @synchronized(self.uploadFiles) {
+        [self.uploadFiles removeObjectForKey:ufile.lpath];
+    }
 }
 
-- (void)search:(NSString *)keyword
+- (void)search:(NSString *)keyword repo:(NSString *)repoId
        success:(void (^)(NSURLRequest *request, NSHTTPURLResponse *response, id JSON, NSMutableArray *results))success
        failure:(void (^)(NSURLRequest *request, NSHTTPURLResponse *response, id JSON, NSError *error))failure
 {
     NSString *url = [NSString stringWithFormat:API_URL"/search/?q=%@&per_page=100", [keyword escapedUrl]];
+    if (repoId)
+        url = [url stringByAppendingFormat:@"&search_repo=%@", repoId];
     [self sendRequest:url success:^(NSURLRequest *request, NSHTTPURLResponse *response, id JSON) {
         NSMutableArray *results = [[NSMutableArray alloc] init];
         for (NSDictionary *itemInfo in [JSON objectForKey:@"results"]) {
@@ -873,6 +1006,12 @@ static AFHTTPRequestSerializer <AFURLRequestSerialization> * _requestSerializer;
     return [[NSBundle mainBundle] pathForResource:@"account" ofType:@"png"];
 }
 
+- (UIImage *)avatarForAccount:(NSString *)email
+{
+    NSString *path = [[NSBundle mainBundle] pathForResource:@"account" ofType:@"png"];
+    return [UIImage imageWithContentsOfFile:path];
+}
+
 - (void)downloadAvatar:(BOOL)force;
 {
     Debug("%@, %d\n", self.address, [self authorized]);
@@ -917,30 +1056,29 @@ static AFHTTPRequestSerializer <AFURLRequestSerialization> * _requestSerializer;
         return;
     }
 
-    Debug("Current %ld photos need to upload, dir=%@", (long)self.photosArray.count, dir.path);
+    Debug("Current %u, %u photos need to upload, dir=%@", (unsigned)self.photosArray.count, (unsigned)self.uploadingArray.count, dir.path);
 
     int count = 0;
     while (_uploadingArray.count < 5 && count++ < 5) {
         NSURL *url = [self popUploadPhoto];
         if (!url) break;
-        [self addUploadingPhoto:url];
         [SeafGlobal.sharedObject assetForURL:url
                                  resultBlock:^(ALAsset *asset) {
                                      NSString *filename = asset.defaultRepresentation.filename;
                                      if (!filename) {
-                                         Warning("Failed to get asset name: %@", asset);
-                                         return;
+                                         [self removeUploadingPhoto:url];
+                                         return Warning("Failed to get asset name: %@", asset);
                                      }
                                      NSString *path = [self.localUploadDir stringByAppendingPathComponent:filename];
                                      SeafUploadFile *file = [self getUploadfile:path];
                                      if (!file) {
-                                         Warning("Failed to init upload file: %@", path);
-                                         return;
+                                         [self removeUploadingPhoto:url];
+                                         return Warning("Failed to init upload file: %@", path);
                                      }
                                      file.autoSync = true;
                                      [file setAsset:asset url:url];
-                                     [dir addUploadFile:file flush:false];
-                                     Debug("Add file %@ to upload list: %@", filename, dir.path);
+                                     file.udir = dir;
+                                     Debug("Add file %@ to upload list: %@ current %u %u", filename, dir.path, (unsigned)_photosArray.count, (unsigned)_uploadingArray.count);
                                      [SeafGlobal.sharedObject addUploadTask:file];
                                  }
                                 failureBlock:^(NSError *error){
@@ -961,6 +1099,8 @@ static AFHTTPRequestSerializer <AFURLRequestSerialization> * _requestSerializer;
     obj.url = ufile.assetURL.absoluteString;
     [[SeafGlobal sharedObject] saveContext];
     [self removeUploadingPhoto:ufile.assetURL];
+    Debug("Autosync file %@ %@ uploaded %d, remain %u %u", ufile.name, ufile.assetURL, [self IsPhotoUploaded:ufile.assetURL], (unsigned)_photosArray.count, (unsigned)_uploadingArray.count);
+
     if (!ufile.delegate) [ufile.udir removeUploadFile:ufile];
     if (_photSyncWatcher) [_photSyncWatcher photoSyncChanged:self.photosInSyncing];
 }
@@ -988,6 +1128,23 @@ static AFHTTPRequestSerializer <AFURLRequestSerialization> * _requestSerializer;
     return results.count > 0;
 }
 
+- (NSUInteger)autoSyncedNum
+{
+    NSManagedObjectContext *context = [[SeafGlobal sharedObject] managedObjectContext];
+    NSFetchRequest *request = [[NSFetchRequest alloc] init];
+    [request setEntity:[NSEntityDescription entityForName:@"UploadedPhotos" inManagedObjectContext:context]];
+    [request setIncludesSubentities:NO];
+    [request setPredicate:[NSPredicate predicateWithFormat:@"server==%@ AND username==%@", self.address, self.username]];
+
+    NSError *err;
+    NSUInteger count = [context countForFetchRequest:request error:&err];
+    if(count == NSNotFound) {
+        Warning("Failed to fet synced count");
+        return 0;
+    }
+
+    return count;
+}
 - (void)resetUploadedPhotos
 {
     self.uploadFiles = [[NSMutableDictionary alloc] init];
@@ -1044,7 +1201,9 @@ static AFHTTPRequestSerializer <AFURLRequestSerialization> * _requestSerializer;
     @synchronized(_photosArray) {
         if (!self.photosArray || self.photosArray.count == 0) return nil;
         NSURL *url = [self.photosArray objectAtIndex:0];
+        [self addUploadingPhoto:url];
         [self.photosArray removeObject:url];
+        Debug("Picked %@ remain: %u %u", url, (unsigned)_photosArray.count, (unsigned)_uploadingArray.count);
         return url;
     }
 }
@@ -1068,13 +1227,14 @@ static AFHTTPRequestSerializer <AFURLRequestSerialization> * _requestSerializer;
 - (void)checkPhotos
 {
     if (!_inAutoSync) return;
-    Debug("Check photos for server %@", _address);
-    if (!self.videoSync) [self clearUploadingVideos];
-
     @synchronized(self) {
         if (_inCheckPhotoss) return;
         _inCheckPhotoss = true;
     }
+
+    Debug("Check photos for server %@, current %u %u", _address, (unsigned)_photosArray.count, (unsigned)_uploadingArray.count);
+    if (!self.videoSync) [self clearUploadingVideos];
+
     NSMutableArray *photos = [[NSMutableArray alloc] init];
     void (^assetEnumerator)(ALAsset *, NSUInteger, BOOL *) = ^(ALAsset *asset, NSUInteger index, BOOL *stop) {
         NSURL *url = [self uploadURLForAsset:asset];
@@ -1134,48 +1294,57 @@ static AFHTTPRequestSerializer <AFURLRequestSerialization> * _requestSerializer;
 
 - (void)updateUploadDir:(SeafDir *)dir
 {
-    if (_syncDir && [_syncDir.repoId isEqualToString:dir.repoId] && [_syncDir.path isEqualToString:dir.path])
-        return;
-    _syncDir = dir;
+    BOOL changed = !_syncDir || ![_syncDir.repoId isEqualToString:dir.repoId] || ![_syncDir.path isEqualToString:dir.path];
+    if (changed)
+        _syncDir = dir;
     Debug("%ld photos remain, syncdir: %@ %@", (long)self.photosArray.count, _syncDir.repoId, _syncDir.name);
-    [self pickPhotosForUpload];
+    [self checkPhotos];
 }
 
 - (void)checkUploadDir
 {
-    NSString *autoSyncRepo = [[self getAttribute:@"autoSyncRepo"] stringValue];
+    NSString *autoSyncRepo = self.autoSyncRepo;
     SeafRepo *repo = [self getRepo:autoSyncRepo];
     if (!repo) {
+        Warning("No repo %@", self.autoSyncRepo);
+        [_rootFolder loadContent:NO];
         _syncDir = nil;
         return;
     }
     [repo loadContent:NO];
     SeafDir *uploadDir = [self getCameraUploadDir:repo];
     if (uploadDir) {
-        [self updateUploadDir:uploadDir];
-        return;
+        return [self updateUploadDir:uploadDir];
     }
 
-    [repo downloadContentSuccess:^(SeafDir *dir) {
-        SeafDir *uploadDir = [self getCameraUploadDir:repo];
+    [repo downloadContentSuccess:^(SeafDir *rdir) {
+        SeafDir *uploadDir = [self getCameraUploadDir:rdir];
         if (uploadDir) {
-            [self updateUploadDir:uploadDir];
-            return;
+            return [self updateUploadDir:uploadDir];
         } else {
             [repo mkdir:CAMERA_UPLOADS_DIR success:^(SeafDir *dir) {
                 SeafDir *uploadDir = [self getCameraUploadDir:dir];
                 [self updateUploadDir:uploadDir];
             } failure:^(SeafDir *dir) {
+                Warning("Failed to create %@", CAMERA_UPLOADS_DIR);
                 _syncDir = nil;
             }];
         }
     } failure:^(SeafDir *dir) {
+        Warning("Failed to get repo file list: %@", dir.repoId);
         _syncDir = nil;
     }];
 }
 
-- (void)checkPhotoChanges:(NSNotification *)note
+- (void)photosChanged:(NSNotification *)note
 {
+    if (!_inAutoSync)
+        return;
+    Debug("photos changed %d for server %@, current: %u %u", _inAutoSync, _address, (unsigned)_photosArray.count, (unsigned)_uploadingArray.count);
+    if (!_syncDir) {
+        Warning("Sync dir not exists, create.");
+        [self checkUploadDir];
+    }
     [self checkPhotos];
 }
 
@@ -1187,7 +1356,7 @@ static AFHTTPRequestSerializer <AFURLRequestSerialization> * _requestSerializer;
         return;
     }
 
-    BOOL value = self.isAutoSync && ([[self getAttribute:@"autoSyncRepo"] stringValue] != nil);
+    BOOL value = self.isAutoSync && (self.autoSyncRepo != nil);
     if (_inAutoSync != value) {
         if (value) {
             Debug("Start auto sync for server %@", _address);
@@ -1204,18 +1373,18 @@ static AFHTTPRequestSerializer <AFURLRequestSerialization> * _requestSerializer;
     }
     _inAutoSync = value;
     if (_inAutoSync) {
-        _syncDir = nil;
         Debug("start auto sync, check photos for server %@", _address);
         [self checkUploadDir];
-        [self checkPhotos];
     }
 }
 
 - (void)removeVideosFromArray:(NSMutableArray *)arr {
+    if (arr.count  == 0)
+        return;
     @synchronized(arr) {
         NSMutableArray *videos = [[NSMutableArray alloc] init];
         for (NSURL *url in arr) {
-            if (![Utils isVideoExt:url.pathExtension])
+            if ([Utils isVideoExt:url.pathExtension])
                 [videos addObject:url];
         }
         [arr removeObjectsInArray:videos];
@@ -1232,14 +1401,17 @@ static AFHTTPRequestSerializer <AFURLRequestSerialization> * _requestSerializer;
 - (void)downloadDir:(SeafDir *)dir
 {
     [dir downloadContentSuccess:^(SeafDir *dir) {
+        Debug("dir %@ items: %lu", dir.path, (unsigned long)dir.items.count);
+        long delay = 1;
         for (SeafBase *item in dir.items) {
+            delay += 1;
             if ([item isKindOfClass:[SeafFile class]]) {
                 SeafFile *file = (SeafFile *)item;
-                Debug("download file: %@, %@", item.repoId, item.path );
-                [SeafGlobal.sharedObject addDownloadTask:file];
+                Debug("download file: %@, %@ after %ld ms", item.repoId, item.path, delay);
+                [SeafGlobal.sharedObject performSelector:@selector(addDownloadTask:) withObject:file afterDelay:delay];
             } else if ([item isKindOfClass:[SeafDir class]]) {
-                Debug("download dir: %@, %@", item.repoId, item.path );
-                [self downloadDir:(SeafDir *)item];
+                Debug("download dir: %@, %@ after %ld ms", item.repoId, item.path, delay);
+                [self performSelector:@selector(downloadDir:) withObject:(SeafDir *)item afterDelay:delay];
             }
         }
     } failure:^(SeafDir *dir) {

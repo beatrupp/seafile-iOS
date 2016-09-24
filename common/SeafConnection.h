@@ -13,7 +13,7 @@
 #define HTTP_ERR_LOGIN_INCORRECT_PASSWORD       400
 #define HTTP_ERR_REPO_PASSWORD_REQUIRED         440
 
-#define DEFAULT_TIMEOUT 90
+#define DEFAULT_TIMEOUT 120
 
 enum MSG_TYPE{
     MSG_NONE = 0,
@@ -41,12 +41,14 @@ BOOL SeafServerTrustIsValid(SecTrustRef serverTrust);
 
 @protocol SeafLoginDelegate <NSObject>
 - (void)loginSuccess:(SeafConnection *)connection;
-- (void)loginFailed:(SeafConnection *)connection error:(NSError *)error code:(NSInteger)errorCode;
+- (void)loginFailed:(SeafConnection *)connection response:(NSURLResponse *)response error:(NSError *)error;
+- (BOOL)authorizeInvalidCert:(NSURLProtectionSpace *)protectionSpace;
+- (id)getClientCertPersistentRef:(NSURLCredential *__autoreleasing *)credential; // return the persistentRef
+
 @end
 
 @protocol SeafConnectionDelegate <NSObject>
 - (void)loginRequired:(SeafConnection *)connection;
-- (BOOL)continueWithInvalidCert:(NSURLProtectionSpace *)protectionSpace;
 
 @end
 
@@ -69,6 +71,8 @@ BOOL SeafServerTrustIsValid(SecTrustRef serverTrust);
 @property (readonly) long long usage;
 @property (readonly, strong) NSString *token;
 @property (readonly) BOOL authorized;
+@property (readonly) BOOL isSearchEnabled;
+@property (readonly) BOOL isActivityEnabled;
 @property (readwrite, nonatomic, getter=isWifiOnly) BOOL wifiOnly;
 @property (readwrite, nonatomic, getter=isAutoSync) BOOL autoSync;
 @property (readwrite, nonatomic, getter=isVideoSync) BOOL videoSync;
@@ -93,6 +97,9 @@ BOOL SeafServerTrustIsValid(SecTrustRef serverTrust);
 
 - (void)resetUploadedPhotos;
 - (void)clearAccount;
+- (void)logout;
+
+- (NSUInteger)autoSyncedNum;
 
 - (NSURLRequest *)buildRequest:(NSString *)url method:(NSString *)method form:(NSString *)form;
 
@@ -117,14 +124,18 @@ BOOL SeafServerTrustIsValid(SecTrustRef serverTrust);
             failure:(void (^)(NSURLRequest *request, NSHTTPURLResponse *response, id JSON, NSError *error))failure;
 
 - (void)loginWithUsername:(NSString *)username password:(NSString *)password;
+- (void)loginWithUsername:(NSString *)username password:(NSString *)password otp:(NSString *)otp;
+
 -(void)setToken:(NSString *)token forUser:(NSString *)username isShib:(BOOL)isshib;
 
-- (void)getAccountInfo:(void (^)(bool result, SeafConnection *conn))handler;
+- (void)getAccountInfo:(void (^)(bool result))handler;
 
 - (void)getStarredFiles:(void (^)(NSHTTPURLResponse *response, id JSON))success
                 failure:(void (^)(NSHTTPURLResponse *response, NSError *error))failure;
 
-- (void)search:(NSString *)keyword
+- (void)getServerInfo:(void (^)(bool result))handler;
+
+- (void)search:(NSString *)keyword repo:(NSString *)repoId
        success:(void (^)(NSURLRequest *request, NSHTTPURLResponse *response, id JSON, NSMutableArray *results))success
        failure:(void (^)(NSURLRequest *request, NSHTTPURLResponse *response, id JSON, NSError *error))failure;
 
@@ -142,6 +153,8 @@ BOOL SeafServerTrustIsValid(SecTrustRef serverTrust);
 
 - (void)registerDevice:(NSData *)deviceToken;
 
+- (UIImage *)avatarForAccount:(NSString *)email;
+
 // Cache
 - (void)loadCache;
 - (id)getCachedObj:(NSString *)key;
@@ -153,12 +166,11 @@ BOOL SeafServerTrustIsValid(SecTrustRef serverTrust);
 - (void)setAttribute:(id)anObject forKey:(NSString *)aKey;
 
 - (void)checkAutoSync;
-- (void)pickPhotosForUpload;
 - (void)fileUploadedSuccess:(SeafUploadFile *)ufile;
 
 - (NSUInteger)photosInSyncing;
 - (void)checkSyncDst:(SeafDir *)dir;
-- (void)checkPhotoChanges:(NSNotification *)note;
+- (void)photosChanged:(NSNotification *)note;
 
 - (void)setRepo:(NSString *)repoId password:(NSString *)password;
 - (NSString *)getRepoPassword:(NSString *)repoId;
